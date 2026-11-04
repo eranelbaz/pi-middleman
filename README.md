@@ -21,7 +21,9 @@ pi install git:github.com/eranelbaz/pi-middleman
 | Thinking | off, minimal, low, medium, high, xhigh, max | Reasoning effort for the middleman |
 | Approval | ask / auto | Review each rewrite, or send it right away |
 | Refine prompt | free text | Instructions given to the middleman |
-| Reset refine prompt | — | Restore the default refine prompt |
+| Editing | session / project / global | Which layer changes are saved to (see [Config](#config)) |
+| Reset refine prompt | — | Remove the refine prompt from the edited layer |
+| Clear overrides | — | Remove every key from the edited layer |
 
 Changes are saved right away and apply to the next prompt without `/reload`. When enabled, the footer shows `mm:<model>` (plus `auto` in auto mode).
 
@@ -76,7 +78,21 @@ If the middleman model is missing, prompts pass through unchanged. If its provid
 
 ## Config
 
-Settings are stored in `~/.pi/agent/middleman.json` (or `$PI_CODING_AGENT_DIR/middleman.json` when that's set):
+Settings come from three layers:
+
+| Scope | Where | Lifetime |
+| --- | --- | --- |
+| session | memory only | Cleared on `/new`, `/resume`, `/fork`, `/reload` and restart |
+| project | `<cwd>/.pi/middleman.json` | Read once per session |
+| global | `~/.pi/agent/middleman.json` (or `$PI_CODING_AGENT_DIR/middleman.json`) | Read on every prompt |
+
+Each key resolves on its own: `session → project → global → defaults`. Files hold only the keys they override. `provider` and `model` must be set together, or both are ignored in that layer.
+
+Project files are used only in repos you have explicitly trusted in pi (pi's trust prompt or `/trust`), never in your home directory. They can't set `approval`, and are read once at session start, so changes (e.g. from `git pull`) apply in the next session. Trust is pi's nearest-ancestor decision, so trusting a parent folder (e.g. `~/projects`) enables project files in every repo under it. Project files can be committed for a team or gitignored for personal use.
+
+In `/middleman`, **Editing** picks the layer your changes go to. Each label shows which layer its value comes from. "Reset" and "Clear" remove keys from the layer being edited.
+
+Example global file:
 
 ```json
 {
@@ -89,7 +105,7 @@ Settings are stored in `~/.pi/agent/middleman.json` (or `$PI_CODING_AGENT_DIR/mi
 }
 ```
 
-If the file can't be read or isn't a JSON object, prompts pass through, the footer shows `mm:config error`, and `/middleman` refuses to overwrite it until you fix or delete it. Hand edits are picked up on the next prompt.
+If a config file can't be read or isn't a JSON object, prompts pass through, the footer shows `mm:config error`, and `/middleman` never overwrites it. A broken global file keeps `/middleman` closed until you fix or delete it; hand edits to it apply on the next prompt. A broken project file is shown at the top of `/middleman`; select it to re-read the file after fixing it (otherwise it is re-read in the next session).
 
 ### Example: caveman refine prompt
 

@@ -1,17 +1,46 @@
+import { realpathSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { BorderedLoader, getAgentDir } from "@earendil-works/pi-coding-agent";
-import { Container, matchesKey, Spacer, Text } from "@earendil-works/pi-tui";
-import { DEFAULT_CONFIG, loadConfig, type MiddlemanConfig, saveConfig, THINKING_LEVELS } from "../lib/config.ts";
+import { BorderedLoader, getAgentDir, getSelectListTheme, ProjectTrustStore } from "@earendil-works/pi-coding-agent";
+import { Container, fuzzyFilter, Input, matchesKey, type SelectItem, SelectList, Spacer, Text } from "@earendil-works/pi-tui";
+import {
+	type Layer,
+	type MiddlemanConfig,
+	mergeLayers,
+	patchLayer,
+	readLayer,
+	SCOPES,
+	type Scope,
+	sourceOf,
+	THINKING_LEVELS,
+} from "../lib/config.ts";
 import { clip } from "../lib/output.ts";
 import { type Choice, type Outcome, type Resolution, resolveChoice, toOutcome } from "../lib/outcome.ts";
 import { buildContext, reasoningFor, shouldRefine } from "../lib/refine.ts";
 
-const CONFIG_PATH = join(getAgentDir(), "middleman.json");
+const GLOBAL_PATH = join(getAgentDir(), "middleman.json");
 const NOTE_TYPE = "middleman-note";
 const TIMEOUT_MS = 60_000;
 
+type Layers = Partial<Record<Scope, Layer>>;
 type Model = NonNullable<ReturnType<ExtensionContext["modelRegistry"]["find"]>>;
+
+function projectPath(ctx: ExtensionContext): string | undefined {
+	if (!ctx.isProjectTrusted()) return undefined;
+	try {
+		if (realpathSync(ctx.cwd) === realpathSync(homedir())) return undefined;
+		if (new ProjectTrustStore(getAgentDir()).get(ctx.cwd) !== true) return undefined;
+	} catch {
+		return undefined;
+	}
+	return join(ctx.cwd, ".pi", "middleman.json");
+}
+
+function readProject(path: string): Layer {
+	const { approval: _, ...layer } = readLayer(path);
+	return layer;
+}
 
 function resolveModel(ctx: ExtensionContext, cfg: MiddlemanConfig): Model | undefined {
 	return cfg.provider && cfg.model ? ctx.modelRegistry.find(cfg.provider, cfg.model) : undefined;
@@ -83,17 +112,47 @@ async function reviewLoop(ctx: ExtensionContext, original: string, refined: stri
 	}
 }
 
-function showStatus(ctx: ExtensionContext, cfg: MiddlemanConfig | undefined) {
-	if (!cfg) ctx.ui.setStatus("middleman", "mm:config error");
-	else ctx.ui.setStatus("middleman", cfg.enabled ? `mm:${cfg.model ?? "?"}${cfg.approval === "auto" ? " auto" : ""}` : undefined);
-}
+const NAV_KEYS = ["tui.select.up", "tui.select.down", "tui.select.confirm", "tui.select.cancel"] as const;
 
-function refreshStatus(ctx: ExtensionContext) {
-	try {
-		showStatus(ctx, loadConfig(CONFIG_PATH));
-	} catch {
-		showStatus(ctx, undefined);
-	}
+async function pick(ctx: ExtensionContext, title: string, labels: string[], current?: string): Promise<string | undefined> {
+	if (ctx.mode !== "tui") return ctx.ui.select(title, labels);
+	return ctx.ui.custom<string | undefined>((tui, theme, kb, done) => {
+		const items: SelectItem[] = labels.map((label) => ({ value: label, label }));
+		const search = new Input();
+		search.focused = true;
+		const root = new Container();
+		root.addChild(new Text(theme.bold(theme.fg("accent", title)), 1, 0));
+		root.addChild(search);
+		root.addChild(new Spacer(1));
+		const listIndex = root.children.length;
+		const build = (shown: SelectItem[], preselect?: string) => {
+			const list = new SelectList(shown, Math.min(Math.max(shown.length, 1), 10), getSelectListTheme());
+			const i = shown.findIndex((item) => item.value === preselect);
+			if (i !== -1) list.setSelectedIndex(i);
+			list.onSelect = (item) => done(item.value);
+			list.onCancel = () => done(undefined);
+			return list;
+		};
+		const empty = new Text(theme.fg("muted", "No matches"), 1, 0);
+		let list = build(items, current);
+		root.addChild(list);
+		root.addChild(new Spacer(1));
+		root.addChild(new Text(theme.fg("dim", "Type to filter · ↑↓ move · Enter select · Esc back"), 1, 0));
+		return Object.assign(root, {
+			handleInput(data: string) {
+				if (NAV_KEYS.some((k) => kb.matches(data, k))) {
+					list.handleInput(data);
+					return;
+				}
+				search.handleInput(data);
+				const query = search.getValue();
+				const shown = query ? fuzzyFilter(items, query, (item) => item.label) : items;
+				list = build(shown, query ? undefined : current);
+				root.children[listIndex] = shown.length ? list : empty;
+				tui.requestRender();
+			},
+		});
+	});
 }
 
 export default function (pi: ExtensionAPI) {
@@ -105,6 +164,36 @@ export default function (pi: ExtensionAPI) {
 			: theme.fg("dim", `middleman rewrote prompt (${before.length} → ${after.length} chars) — expand to view`);
 		return new Text(`${theme.fg("accent", "⇄ ")}${body}`, 1, 0);
 	});
+
+	let session: Layer = {};
+	let project: { path: string; layer?: Layer; error?: string } | undefined;
+	const loadProject = (ctx: ExtensionContext) => {
+		const path = projectPath(ctx);
+		if (!path) return void (project = undefined);
+		try {
+			project = { path, layer: readProject(path) };
+		} catch (e) {
+			project = { path, error: (e as Error).message };
+		}
+	};
+	const resolve = () => {
+		const layers: Layers = { session, ...(project?.layer && { project: project.layer }), global: readLayer(GLOBAL_PATH) };
+		return { cfg: mergeLayers(SCOPES.map((s) => layers[s] ?? {})), layers, projectError: project?.error };
+	};
+
+	const showStatus = (ctx: ExtensionContext, cfg?: MiddlemanConfig, layers?: Layers) => {
+		if (!cfg) return ctx.ui.setStatus("middleman", "mm:config error");
+		const proj = layers?.project && Object.keys(layers.project).length ? " [proj]" : "";
+		ctx.ui.setStatus("middleman", cfg.enabled ? `mm:${cfg.model ?? "?"}${cfg.approval === "auto" ? " auto" : ""}${proj}` : undefined);
+	};
+	const refreshStatus = (ctx: ExtensionContext) => {
+		try {
+			const { cfg, layers, projectError } = resolve();
+			showStatus(ctx, projectError ? undefined : cfg, layers);
+		} catch {
+			showStatus(ctx, undefined);
+		}
+	};
 
 	const warned = new Set<string>();
 	const warnOnce = (ctx: ExtensionContext, key: string, message: string) => {
@@ -127,6 +216,8 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		warned.clear();
 		pendingNote = undefined;
+		session = {};
+		loadProject(ctx);
 		refreshStatus(ctx);
 	});
 
@@ -137,36 +228,80 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("/middleman requires interactive mode", "error");
 				return;
 			}
-			let cfg: MiddlemanConfig;
-			try {
-				cfg = loadConfig(CONFIG_PATH);
-			} catch (e) {
-				ctx.ui.notify(`Fix or delete the config first: ${(e as Error).message}`, "error");
-				return;
-			}
-			const mark = (label: string, current: boolean) => (current ? `${label} ✓` : label);
+			const show = {
+				enabled: (c: Layer) => (c.enabled ? "on" : "off"),
+				model: (c: Layer) => (c.provider && c.model ? `${c.provider}/${c.model}` : "(not set)"),
+				thinking: (c: Layer) => `${c.thinking}`,
+				approval: (c: Layer) => `${c.approval}`,
+				refinePrompt: (c: Layer) => {
+					const line = (c.refinePrompt ?? "").replace(/\s+/g, " ").trim();
+					return `${line.slice(0, 50)}${line.length > 50 ? "…" : ""}`;
+				},
+			};
+			const write = (scope: Scope, patch: Layer) => {
+				if (scope === "session") {
+					session = Object.fromEntries(Object.entries({ ...session, ...patch }).filter(([, v]) => v !== undefined));
+				} else if (scope === "project") {
+					if (!project) throw new Error("project config is not available");
+					patchLayer(project.path, patch);
+					loadProject(ctx);
+				} else patchLayer(GLOBAL_PATH, patch);
+			};
+			let scope: Scope = "global";
+			let last: string | undefined;
 			while (true) {
-				const saved = JSON.stringify(cfg);
-				const promptLine = cfg.refinePrompt.replace(/\s+/g, " ").trim();
-				const items = {
-					enabled: `Enabled: ${cfg.enabled ? "on" : "off"}`,
-					model: `Model: ${cfg.provider && cfg.model ? `${cfg.provider}/${cfg.model}` : "(not set)"}`,
-					thinking: `Thinking: ${cfg.thinking}`,
-					approval: `Approval: ${cfg.approval}`,
-					prompt: `Refine prompt: ${promptLine.slice(0, 50)}${promptLine.length > 50 ? "…" : ""}`,
-					reset: "Reset refine prompt to default",
+				const scopes = SCOPES.filter((s) => s !== "project" || (project && !project.error));
+				if (!scopes.includes(scope)) scope = "global";
+				let state: ReturnType<typeof resolve>;
+				try {
+					state = resolve();
+				} catch (e) {
+					ctx.ui.notify(`Fix or delete the config first: ${(e as Error).message}`, "error");
+					return;
+				}
+				const { cfg, layers, projectError } = state;
+				const own = layers[scope] ?? {};
+				const label = (name: string, key: keyof typeof show) => {
+					const s = sourceOf(key, layers);
+					const shadowed = own[key] !== undefined && show[key](own) !== show[key](cfg) ? ` · ${scope}: ${show[key](own)}` : "";
+					return `${name}: ${show[key](cfg)}${s === "default" ? "" : ` (${s})`}${shadowed}`;
 				};
-				const pick = await ctx.ui.select("Middleman", Object.values(items));
-				const key = (Object.keys(items) as (keyof typeof items)[]).find((k) => items[k] === pick);
+				const items = {
+					...(projectError && { broken: `⚠ project config broken: ${projectError} (select to re-read)` }),
+					scope: `Editing: ${scope}`,
+					enabled: label("Enabled", "enabled"),
+					model: label("Model", "model"),
+					thinking: label("Thinking", "thinking"),
+					...(scope !== "project" && { approval: label("Approval", "approval") }),
+					prompt: label("Refine prompt", "refinePrompt"),
+					...(own.refinePrompt !== undefined && { reset: `Reset refine prompt (${scope})` }),
+					...(Object.keys(own).length && { clear: `Clear ${scope} overrides` }),
+				};
+				const choice = await pick(ctx, "Middleman", Object.values(items), last && (items as Record<string, string | undefined>)[last]);
+				const key = (Object.keys(items) as (keyof typeof items)[]).find((k) => items[k] === choice);
 				if (!key) break;
-				if (key === "enabled") cfg.enabled = !cfg.enabled;
-				if (key === "approval") cfg.approval = cfg.approval === "ask" ? "auto" : "ask";
-				if (key === "reset") cfg.refinePrompt = DEFAULT_CONFIG.refinePrompt;
+				last = key;
+				if (key === "broken") {
+					warned.delete("config:project");
+					loadProject(ctx);
+					refreshStatus(ctx);
+					continue;
+				}
+				if (key === "scope") {
+					if (!project) ctx.ui.notify("Project scope needs a repo you explicitly trusted in pi (not your home dir)", "info");
+					const s = await pick(ctx, "Apply changes to", scopes, scope);
+					scope = scopes.find((x) => x === s) ?? scope;
+					continue;
+				}
+				let patch: Layer = {};
+				if (key === "enabled") patch = { enabled: !(own.enabled ?? cfg.enabled) };
+				if (key === "approval") patch = { approval: (own.approval ?? cfg.approval) === "ask" ? "auto" : "ask" };
+				if (key === "reset") patch = { refinePrompt: undefined };
+				if (key === "clear") patch = Object.fromEntries(Object.keys(own).map((k) => [k, undefined]));
 				if (key === "thinking") {
-					const labels = THINKING_LEVELS.map((t) => mark(t, t === cfg.thinking));
-					const t = await ctx.ui.select("Thinking effort", labels);
-					const i = t === undefined ? -1 : labels.indexOf(t);
-					if (i !== -1) cfg.thinking = THINKING_LEVELS[i];
+					const t = await pick(ctx, "Thinking effort", THINKING_LEVELS, own.thinking ?? cfg.thinking);
+					const level = THINKING_LEVELS.find((l) => l === t);
+					if (level) patch = { thinking: level };
 				}
 				if (key === "model") {
 					const models = ctx.modelRegistry.getAvailable();
@@ -174,27 +309,34 @@ export default function (pi: ExtensionAPI) {
 						ctx.ui.notify("No models with working auth — log in to a provider first", "warning");
 						continue;
 					}
-					const labels = models.map((x) => mark(`${x.provider}/${x.id}`, x.provider === cfg.provider && x.id === cfg.model));
-					const m = await ctx.ui.select("Middleman model", labels);
+					const labels = models.map((x) => `${x.provider}/${x.id}`);
+					const cur = own.provider ? own : cfg;
+					const m = await pick(ctx, "Middleman model", labels, `${cur.provider}/${cur.model}`);
 					const chosen = m === undefined ? undefined : models[labels.indexOf(m)];
-					if (chosen) {
-						cfg.provider = chosen.provider;
-						cfg.model = chosen.id;
-					}
+					if (chosen) patch = { provider: chosen.provider, model: chosen.id };
 				}
 				if (key === "prompt") {
-					const p = await ctx.ui.editor("Refine prompt", cfg.refinePrompt);
-					if (p?.trim()) cfg.refinePrompt = p;
+					const p = await ctx.ui.editor("Refine prompt", own.refinePrompt ?? cfg.refinePrompt);
+					if (p?.trim()) patch = { refinePrompt: p };
 				}
-				if (JSON.stringify(cfg) === saved) continue;
-				if (cfg.enabled && !cfg.model) ctx.ui.notify("Pick a model or prompts will pass through unchanged", "warning");
+				const keys = Object.keys(patch) as (keyof MiddlemanConfig)[];
+				if (keys.every((k) => own[k] === patch[k])) continue;
+				let after: ReturnType<typeof resolve>;
 				try {
-					saveConfig(CONFIG_PATH, cfg);
+					write(scope, patch);
+					after = resolve();
 				} catch (e) {
 					ctx.ui.notify(`Could not save middleman config: ${(e as Error).message}`, "error");
 					break;
 				}
-				warned.clear();
+				for (const k of keys) {
+					const s = sourceOf(k, after.layers);
+					if (patch[k] !== undefined && s !== "default" && SCOPES.indexOf(s) < SCOPES.indexOf(scope)) {
+						ctx.ui.notify(`${k} is overridden by the ${s} config`, "warning");
+					}
+				}
+				if (after.cfg.enabled && !after.cfg.model) ctx.ui.notify("Pick a model or prompts will pass through unchanged", "warning");
+				for (const k of warned) if (k.startsWith("model:")) warned.delete(k);
 				refreshStatus(ctx);
 			}
 		},
@@ -202,17 +344,22 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("input", async (event, ctx) => {
 		if (!event.streamingBehavior) pendingNote = undefined;
-		let cfg: MiddlemanConfig;
+		const userPrompt = event.source !== "extension" && !event.text.startsWith("/");
+		let state: ReturnType<typeof resolve>;
 		try {
-			cfg = loadConfig(CONFIG_PATH);
+			state = resolve();
 		} catch (e) {
 			showStatus(ctx, undefined);
-			if (event.source !== "extension" && !event.text.startsWith("/")) {
-				warnOnce(ctx, "config", `Middleman config unreadable, passing prompts through: ${(e as Error).message}`);
-			}
+			if (userPrompt) warnOnce(ctx, "config:global", `Middleman config unreadable, passing prompts through: ${(e as Error).message}`);
 			return { action: "continue" };
 		}
-		showStatus(ctx, cfg);
+		const { cfg, layers, projectError } = state;
+		if (projectError) {
+			showStatus(ctx, undefined);
+			if (userPrompt) warnOnce(ctx, "config:project", `Middleman config unreadable, passing prompts through: ${projectError}`);
+			return { action: "continue" };
+		}
+		showStatus(ctx, cfg, layers);
 		if (!shouldRefine(event, cfg)) return { action: "continue" };
 
 		const model = resolveModel(ctx, cfg);
