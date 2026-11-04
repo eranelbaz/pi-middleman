@@ -1,0 +1,61 @@
+{
+  "name": "pi-middleman",
+  "version": "0.1.0",
+  "description": "A Pi extension that rewrites every prompt with a configurable middleman model before sending it, with optional before/after approval",
+  "author": "Eran Elbaz",
+  "license": "MIT",
+  "homepage": "https://github.com/eranelbaz/pi-middleman#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/eranelbaz/pi-middleman"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "prompt",
+    "rewrite"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=20.3"
+  },
+  "files": [
+    "extensions",
+    "lib/*.ts",
+    "!lib/*.test.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "~1.4.0",
+    "@earendil-works/pi-coding-agent": "~1.4.0",
+    "@earendil-works/pi-tui": "~1.4.0",
+    "@jest/globals": "^30.5.2",
+    "@swc/core": "^1.16.21",
+    "@swc/jest": "^0.2.39",
+    "@types/node": "^22.0.0",
+    "jest": "^30.5.2",
+    "typescript": "^5.6.0"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "scripts": {
+    "test": "jest",
+    "check": "tsc --noEmit"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "roots": ["<rootDir>/lib"],
+    "transform": {
+      "^.+\\.ts$": ["@swc/jest", { "module": { "type": "commonjs" } }]
+    }
+  }
+}
