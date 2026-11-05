@@ -41,7 +41,7 @@ Pressing `Esc` (or `Ctrl+C`) while the middleman is working cancels the rewrite 
 
 ## Auto mode and headless behavior
 
-In auto mode, and always in headless runs (`pi -p`, RPC), the rewrite is sent without review. Whenever a rewrite is sent (auto or approved), a collapsed `⇄` note is recorded below your message; expand it to see before and after. The note is display-only and is not sent to the model.
+If the middleman returns your prompt unchanged, it is sent immediately with no review and no note, even in ask mode. In auto mode, and always in headless runs (`pi -p`, RPC), the rewrite is sent without review. Whenever a rewrite is sent (auto or approved), a collapsed `⇄` note is recorded below your message; expand it to see before and after. The note is display-only and is not sent to the model.
 
 ## Skip rules
 

@@ -381,6 +381,8 @@ export default function (pi: ExtensionAPI) {
 				return { action: "continue" };
 			}
 
+			if (outcome.text === event.text) return { action: "continue" };
+
 			let res: Resolution = { action: "transform", text: outcome.text };
 			if (cfg.approval === "ask" && tui) {
 				const { choice, text } = await reviewLoop(ctx, event.text, outcome.text);
