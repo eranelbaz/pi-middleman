@@ -27,13 +27,13 @@ describe("config", () => {
 
 	it("merges partial file over defaults", () => {
 		const p = tmp();
-		writeFileSync(p, JSON.stringify({ enabled: true, approval: "auto" }));
-		expect(loadConfig(p)).toEqual({ ...DEFAULT_CONFIG, enabled: true, approval: "auto" });
+		writeFileSync(p, JSON.stringify({ skillRouting: true, thinking: "low" }));
+		expect(loadConfig(p)).toEqual({ ...DEFAULT_CONFIG, skillRouting: true, thinking: "low" });
 	});
 
 	it("drops invalid values", () => {
 		const p = tmp();
-		writeFileSync(p, JSON.stringify({ thinking: "huge", approval: "maybe", refinePrompt: "   " }));
+		writeFileSync(p, JSON.stringify({ thinking: "huge", skillRouting: "yes", provider: "   ", model: "m" }));
 		expect(loadConfig(p)).toEqual(DEFAULT_CONFIG);
 	});
 
@@ -41,7 +41,7 @@ describe("config", () => {
 
 describe("layers", () => {
 	it("parseLayer keeps only valid keys that are present", () => {
-		expect(parseLayer({ enabled: true, thinking: "huge", refinePrompt: " ", extra: 1 }, "p")).toEqual({ enabled: true });
+		expect(parseLayer({ skillRouting: true, thinking: "huge", refinePrompt: "x", enabled: true, extra: 1 }, "p")).toEqual({ skillRouting: true });
 		expect(parseLayer({}, "p")).toEqual({});
 	});
 
@@ -66,38 +66,38 @@ describe("layers", () => {
 	});
 
 	it("mergeLayers resolves per key, first layer wins, ignores undefined", () => {
-		const cfg = mergeLayers([{ refinePrompt: "cave", thinking: undefined }, { enabled: true, refinePrompt: "proj", thinking: "low" }, { provider: "p", model: "m", approval: "auto" }]);
-		expect(cfg).toEqual({ ...DEFAULT_CONFIG, enabled: true, refinePrompt: "cave", thinking: "low", provider: "p", model: "m", approval: "auto" });
+		const cfg = mergeLayers([{ skillRouting: false, thinking: undefined }, { skillRouting: true, thinking: "low" }, { provider: "p", model: "m" }]);
+		expect(cfg).toEqual({ ...DEFAULT_CONFIG, skillRouting: false, thinking: "low", provider: "p", model: "m" });
 	});
 
 	it("sourceOf reports the winning scope", () => {
-		const layers = { session: { thinking: "low" as const }, project: { thinking: "high" as const, enabled: true }, global: { model: "m" } };
+		const layers = { session: { thinking: "low" as const }, project: { thinking: "high" as const, skillRouting: true }, global: { model: "m" } };
 		expect(sourceOf("thinking", layers)).toBe("session");
-		expect(sourceOf("enabled", layers)).toBe("project");
+		expect(sourceOf("skillRouting", layers)).toBe("project");
 		expect(sourceOf("model", layers)).toBe("global");
-		expect(sourceOf("approval", layers)).toBe("default");
+		expect(sourceOf("provider", layers)).toBe("default");
 	});
 });
 
 describe("patchLayer", () => {
 	it("creates the file with only the patched keys", () => {
 		const p = join(dirname(tmp()), "sub", "middleman.json");
-		patchLayer(p, { refinePrompt: "cave" });
-		expect(JSON.parse(readFileSync(p, "utf8"))).toEqual({ refinePrompt: "cave" });
+		patchLayer(p, { thinking: "low" });
+		expect(JSON.parse(readFileSync(p, "utf8"))).toEqual({ thinking: "low" });
 		expect(readFileSync(p, "utf8").endsWith("\n")).toBe(true);
 	});
 
 	it("preserves unknown and invalid keys and deletes undefined ones", () => {
 		const p = tmp();
-		writeFileSync(p, JSON.stringify({ $schema: "s", thinking: "hgih", enabled: true, model: "m", provider: "p" }));
-		patchLayer(p, { enabled: undefined, approval: "auto" });
-		expect(JSON.parse(readFileSync(p, "utf8"))).toEqual({ $schema: "s", thinking: "hgih", model: "m", provider: "p", approval: "auto" });
+		writeFileSync(p, JSON.stringify({ $schema: "s", thinking: "hgih", skillRouting: true, model: "m", provider: "p" }));
+		patchLayer(p, { skillRouting: undefined, thinking: "low" });
+		expect(JSON.parse(readFileSync(p, "utf8"))).toEqual({ $schema: "s", thinking: "low", model: "m", provider: "p" });
 	});
 
 	it("removes the file when no keys remain", () => {
 		const p = tmp();
-		writeFileSync(p, JSON.stringify({ enabled: true }));
-		patchLayer(p, { enabled: undefined });
+		writeFileSync(p, JSON.stringify({ skillRouting: true }));
+		patchLayer(p, { skillRouting: undefined });
 		expect(existsSync(p)).toBe(false);
 	});
 
@@ -105,7 +105,7 @@ describe("patchLayer", () => {
 		const p = tmp();
 		for (const body of ["{nope", "[]", "null"]) {
 			writeFileSync(p, body);
-			expect(() => patchLayer(p, { enabled: true })).toThrow(ConfigError);
+			expect(() => patchLayer(p, { skillRouting: true })).toThrow(ConfigError);
 			expect(readFileSync(p, "utf8")).toBe(body);
 		}
 	});
@@ -113,7 +113,7 @@ describe("patchLayer", () => {
 	it("leaves no temp file behind when the write fails", () => {
 		const p = tmp();
 		mkdirSync(p);
-		expect(() => patchLayer(p, { enabled: true })).toThrow();
+		expect(() => patchLayer(p, { skillRouting: true })).toThrow();
 		expect(readdirSync(dirname(p))).toEqual(["middleman.json"]);
 	});
 });
