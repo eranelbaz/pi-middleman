@@ -38,14 +38,14 @@ Instead of installing skills into pi (where every skill's description goes into 
 Manage them with `/middleman-skill` (not `pi install`, so they stay out of pi's system prompt):
 
 ```text
-/middleman-skill install user/repo            # GitHub shorthand, optional @ref
+/middleman-skill install user/repo            # GitHub shorthand, optional @branch, @tag or @commit
 /middleman-skill install git:gitlab.com/a/b   # any git URL (https, ssh, git@…)
-/middleman-skill install ./path/to/skills     # local folder or single .md file
+/middleman-skill install ./path/to/skills     # local path (prefix ./ if it looks like user/repo)
 /middleman-skill list
 /middleman-skill remove <name>
 ```
 
-Add `--project` to install into or remove from the project folder. Install finds every skill in the source (folders with `SKILL.md`, using pi's discovery rules) and copies each into its own folder named after the skill, asking before overwriting. Git sources are shallow-cloned to a temp dir and discarded afterwards; there is no update command yet, so reinstall to update.
+Add `--project` to install into or remove from the project folder. Install finds every skill in the source (folders with `SKILL.md` using pi's discovery rules, or `.md` files with a `description` in their frontmatter) and copies each into its own folder named after the skill (frontmatter `name`, else the folder or file name), asking before overwriting; headless runs refuse to overwrite, so remove first. Nothing is replaced unless every skill copied successfully. Skill names must be lowercase letters, digits and single hyphens; invalid, duplicate, and symlinked skills are skipped and listed. Dotfiles (including `.env` and `.git`), `node_modules`, and symlinks are never copied, and a source inside the skills folder is refused. Git sources are cloned to a temp dir that is deleted afterwards, with credential prompts disabled and a 120 second limit; there is no update command yet, so reinstall to update.
 
 With **Skill routing** on, each prompt you send is shown to the middleman model together with the list of skill names and descriptions. It picks up to 3 relevant skills (often none), and their full `SKILL.md` bodies are injected as a message before the agent runs, shown as a collapsed `✦ middleman loaded skills: …` line. Skills already loaded earlier in the current branch are not injected again.
 

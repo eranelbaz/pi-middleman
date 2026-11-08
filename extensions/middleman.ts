@@ -1,12 +1,15 @@
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve as resolvePath } from "node:path";
+import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	BorderedLoader,
 	getAgentDir,
 	getSelectListTheme,
 	loadSkillsFromDir,
+	parseFrontmatter,
 	ProjectTrustStore,
 	type Skill,
 	stripFrontmatter,
@@ -26,7 +29,8 @@ import {
 import { clip } from "../lib/output.ts";
 import { type Choice, type Outcome, type Resolution, resolveChoice, toOutcome } from "../lib/outcome.ts";
 import { buildContext, extractText, reasoningFor, shouldRefine } from "../lib/refine.ts";
-import { buildRouteContext, parsePicks, parseSource } from "../lib/skills.ts";
+import { installInto, planInstall, type SkillRef, skillName } from "../lib/install.ts";
+import { buildRouteContext, isValidSkillName, parsePicks, parseSource } from "../lib/skills.ts";
 
 const GLOBAL_PATH = join(getAgentDir(), "middleman.json");
 const GLOBAL_SKILLS = join(getAgentDir(), "middleman-skills");
@@ -164,44 +168,69 @@ function loadRoutedSkills(dirs: string[]): Skill[] {
 	return [...byName.values()];
 }
 
-async function installSkills(pi: ExtensionAPI, ctx: ExtensionContext, source: string, target: string): Promise<string[]> {
-	const src = parseSource(source);
-	let root: string;
-	let tmp: string | undefined;
-	if (src.kind === "path") {
-		root = resolvePath(ctx.cwd, src.path.replace(/^~(?=$|\/)/, homedir()));
-		if (!existsSync(root)) throw new Error(`${root} does not exist`);
-	} else {
-		tmp = mkdtempSync(join(tmpdir(), "middleman-skill-"));
-		root = join(tmp, "repo");
-		const res = await pi.exec("git", ["clone", "--depth", "1", ...(src.ref ? ["--branch", src.ref] : []), src.url, root], { timeout: 120_000 });
-		if (res.code !== 0) {
-			rmSync(tmp, { recursive: true, force: true });
-			throw new Error(`git clone failed: ${(res.stderr || res.stdout).trim()}`);
-		}
-	}
+const execFileAsync = promisify(execFile);
+const GIT_TIMEOUT_MS = 120_000;
+const SHA = /^[0-9a-f]{7,40}$/i;
+const redact = (s: string) => s.replace(/\/\/[^/@\s]+@/g, "//***@");
+
+async function git(args: string[], signal: AbortSignal, cwd?: string): Promise<void> {
 	try {
-		const { skills, diagnostics } = root.endsWith(".md")
-			? loadSkillsFromDir({ dir: dirname(root), source: "middleman" })
-			: loadSkillsFromDir({ dir: root, source: "middleman" });
-		const found = root.endsWith(".md") ? skills.filter((s) => s.filePath === root) : skills;
-		if (!found.length) throw new Error(`no skills found${diagnostics.length ? `: ${diagnostics.map((d) => d.message).join("; ")}` : ""}`);
-		const clashes = found.filter((s) => existsSync(join(target, s.name))).map((s) => s.name);
-		if (clashes.length && !(await ctx.ui.confirm("Overwrite skills?", `Already installed: ${clashes.join(", ")}`))) {
-			throw new Error("cancelled, nothing installed");
+		await execFileAsync("git", args, { cwd, signal, env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } });
+	} catch (e) {
+		if (signal.aborted) throw new Error(`git ${args[0]} timed out after ${GIT_TIMEOUT_MS / 1000}s`);
+		const stderr = (e as { stderr?: string }).stderr?.trim();
+		throw new Error(`git ${args[0]} failed${stderr ? `: ${redact(stderr)}` : ""}`);
+	}
+}
+
+function findSkills(root: string): { found: SkillRef[]; problems: string[] } {
+	if (statSync(root).isFile()) {
+		let frontmatter: { name?: unknown; description?: unknown };
+		try {
+			frontmatter = parseFrontmatter<{ name?: unknown; description?: unknown }>(readFileSync(root, "utf8")).frontmatter;
+		} catch (e) {
+			return { found: [], problems: [`${root}: invalid frontmatter: ${(e as Error).message}`] };
 		}
-		mkdirSync(target, { recursive: true });
-		for (const skill of found) {
-			const dest = join(target, skill.name);
-			rmSync(dest, { recursive: true, force: true });
-			if (basename(skill.filePath) === "SKILL.md") {
-				cpSync(skill.baseDir, dest, { recursive: true, filter: (p) => basename(p) !== ".git" });
+		if (typeof frontmatter.description !== "string" || !frontmatter.description.trim()) return { found: [], problems: [`${root}: missing description`] };
+		return { found: [{ name: skillName(root, frontmatter.name), filePath: root, baseDir: dirname(root) }], problems: [] };
+	}
+	const { skills, diagnostics } = loadSkillsFromDir({ dir: root, source: "middleman" });
+	const found = skills.map((s) => {
+		if (basename(s.filePath) === "SKILL.md") return s;
+		const { frontmatter } = parseFrontmatter<{ name?: unknown }>(readFileSync(s.filePath, "utf8"));
+		return { ...s, name: skillName(s.filePath, frontmatter.name) };
+	});
+	return { found, problems: diagnostics.map((d) => `${d.path ?? root}: ${d.message}`) };
+}
+
+async function installSkills(ctx: ExtensionContext, source: string, target: string): Promise<{ names: string[]; skipped: string[] }> {
+	const src = parseSource(source, (p) => existsSync(resolvePath(ctx.cwd, p)));
+	const tmp = src.kind === "git" ? mkdtempSync(join(tmpdir(), "middleman-skill-")) : undefined;
+	try {
+		let root: string;
+		if (src.kind === "path") {
+			root = resolvePath(ctx.cwd, src.path.replace(/^~(?=$|\/)/, homedir()));
+			if (!existsSync(root)) throw new Error(`${root} does not exist`);
+		} else {
+			root = join(tmp as string, "repo");
+			const signal = AbortSignal.timeout(GIT_TIMEOUT_MS);
+			if (src.ref && SHA.test(src.ref)) {
+				await git(["clone", "--filter=blob:none", "--no-checkout", "--", src.url, root], signal);
+				await git(["checkout", src.ref, "--"], signal, root);
 			} else {
-				mkdirSync(dest);
-				cpSync(skill.filePath, join(dest, "SKILL.md"));
+				await git(["clone", "--depth", "1", ...(src.ref ? ["--branch", src.ref] : []), "--", src.url, root], signal);
 			}
 		}
-		return found.map((s) => s.name);
+		const { found, problems } = findSkills(root);
+		const { install, skipped } = planInstall(found, statSync(root).isFile() ? dirname(root) : root);
+		if (!install.length) throw new Error(`no installable skills found${[...skipped, ...problems].length ? `: ${[...skipped, ...problems].join("; ")}` : ""}`);
+		const clashes = install.filter((s) => existsSync(join(target, s.name))).map((s) => s.name);
+		if (clashes.length) {
+			if (!ctx.hasUI) throw new Error(`already installed: ${clashes.join(", ")} (remove first)`);
+			if (!(await ctx.ui.confirm("Overwrite skills?", `Already installed: ${clashes.join(", ")}`))) throw new Error("cancelled, nothing installed");
+		}
+		installInto(target, install, found);
+		return { names: install.map((s) => s.name), skipped };
 	} finally {
 		if (tmp) rmSync(tmp, { recursive: true, force: true });
 	}
@@ -356,18 +385,18 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (sub === "remove" && arg && target) {
 				const dest = join(target, arg);
-				if (basename(arg) !== arg || !existsSync(join(dest, "SKILL.md"))) return ctx.ui.notify(`No skill "${arg}" in ${target}`, "error");
+				if (!isValidSkillName(arg) || !existsSync(join(dest, "SKILL.md"))) return ctx.ui.notify(`No skill "${arg}" in ${target}`, "error");
 				rmSync(dest, { recursive: true, force: true });
 				return ctx.ui.notify(`Removed middleman skill ${arg}`, "info");
 			}
 			if (sub === "install" && arg && target) {
 				try {
-					const names = await installSkills(pi, ctx, arg, target);
+					const { names, skipped } = await installSkills(ctx, arg, target);
 					let routing = " (turn on Skill routing in /middleman to use them)";
 					try {
 						if (resolve().cfg.skillRouting) routing = "";
 					} catch {}
-					ctx.ui.notify(`Installed ${names.join(", ")} to ${target}${routing}`, "info");
+					ctx.ui.notify(`Installed ${names.join(", ")} to ${target}${skipped.length ? `; skipped ${skipped.join(", ")}` : ""}${routing}`, "info");
 				} catch (e) {
 					ctx.ui.notify(`Skill install failed: ${(e as Error).message}`, "error");
 				}
