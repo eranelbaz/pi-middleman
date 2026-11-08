@@ -1,8 +1,16 @@
-import { realpathSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { basename, dirname, join, resolve as resolvePath } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { BorderedLoader, getAgentDir, getSelectListTheme, ProjectTrustStore } from "@earendil-works/pi-coding-agent";
+import {
+	BorderedLoader,
+	getAgentDir,
+	getSelectListTheme,
+	loadSkillsFromDir,
+	ProjectTrustStore,
+	type Skill,
+	stripFrontmatter,
+} from "@earendil-works/pi-coding-agent";
 import { Container, fuzzyFilter, Input, matchesKey, type SelectItem, SelectList, Spacer, Text } from "@earendil-works/pi-tui";
 import {
 	type Layer,
@@ -17,11 +25,15 @@ import {
 } from "../lib/config.ts";
 import { clip } from "../lib/output.ts";
 import { type Choice, type Outcome, type Resolution, resolveChoice, toOutcome } from "../lib/outcome.ts";
-import { buildContext, reasoningFor, shouldRefine } from "../lib/refine.ts";
+import { buildContext, extractText, reasoningFor, shouldRefine } from "../lib/refine.ts";
+import { buildRouteContext, parsePicks, parseSource } from "../lib/skills.ts";
 
 const GLOBAL_PATH = join(getAgentDir(), "middleman.json");
+const GLOBAL_SKILLS = join(getAgentDir(), "middleman-skills");
 const NOTE_TYPE = "middleman-note";
+const SKILLS_TYPE = "middleman-skills";
 const TIMEOUT_MS = 60_000;
+const ROUTE_TIMEOUT_MS = 20_000;
 
 type Layers = Partial<Record<Scope, Layer>>;
 type Model = NonNullable<ReturnType<ExtensionContext["modelRegistry"]["find"]>>;
@@ -68,6 +80,36 @@ function refineWithLoader(ctx: ExtensionContext, model: Model, cfg: MiddlemanCon
 	});
 }
 
+type Route = { kind: "ok"; picked: Skill[] } | { kind: "failed"; error: string } | { kind: "cancelled" };
+
+async function routeSkills(ctx: ExtensionContext, model: Model, cfg: MiddlemanConfig, skills: Skill[], prompt: string, cancel?: AbortSignal): Promise<Route> {
+	const timeout = AbortSignal.timeout(ROUTE_TIMEOUT_MS);
+	const signal = cancel ? AbortSignal.any([cancel, timeout]) : timeout;
+	try {
+		const res = await ctx.modelRegistry
+			.streamSimple(model, buildRouteContext(skills, prompt), { signal, maxRetries: 0, reasoning: reasoningFor(cfg) })
+			.result();
+		if (cancel?.aborted) return { kind: "cancelled" };
+		if (timeout.aborted) return { kind: "failed", error: `timed out after ${ROUTE_TIMEOUT_MS / 1000}s` };
+		if (res.stopReason !== "stop") return { kind: "failed", error: res.errorMessage ?? `stopped: ${res.stopReason}` };
+		const picked = parsePicks(extractText(res), skills);
+		return picked ? { kind: "ok", picked } : { kind: "failed", error: "no <picked> output" };
+	} catch (e) {
+		if (cancel?.aborted) return { kind: "cancelled" };
+		if (timeout.aborted) return { kind: "failed", error: `timed out after ${ROUTE_TIMEOUT_MS / 1000}s` };
+		return { kind: "failed", error: e instanceof Error ? e.message : String(e) };
+	}
+}
+
+function routeWithLoader(ctx: ExtensionContext, model: Model, cfg: MiddlemanConfig, skills: Skill[], prompt: string): Promise<Route> {
+	return ctx.ui.custom<Route>((tui, theme, _kb, done) => {
+		const loader = new BorderedLoader(tui, theme, `Middleman picking skills with ${cfg.provider}/${cfg.model}... (esc to skip)`);
+		loader.onAbort = () => done({ kind: "cancelled" });
+		routeSkills(ctx, model, cfg, skills, prompt, loader.signal).then(done);
+		return loader;
+	});
+}
+
 function review(ctx: ExtensionContext, original: string, refined: string): Promise<Choice | "edit"> {
 	return ctx.ui.custom<Choice | "edit">((tui, theme, kb, done) => {
 		let full = false;
@@ -110,6 +152,64 @@ async function reviewLoop(ctx: ExtensionContext, original: string, refined: stri
 		const edited = await ctx.ui.editor("Edit rewritten prompt", text);
 		if (edited?.trim()) text = edited;
 	}
+}
+
+function loadRoutedSkills(dirs: string[]): Skill[] {
+	const byName = new Map<string, Skill>();
+	for (const dir of dirs) {
+		for (const skill of loadSkillsFromDir({ dir, source: "middleman" }).skills) {
+			if (!byName.has(skill.name)) byName.set(skill.name, skill);
+		}
+	}
+	return [...byName.values()];
+}
+
+async function installSkills(pi: ExtensionAPI, ctx: ExtensionContext, source: string, target: string): Promise<string[]> {
+	const src = parseSource(source);
+	let root: string;
+	let tmp: string | undefined;
+	if (src.kind === "path") {
+		root = resolvePath(ctx.cwd, src.path.replace(/^~(?=$|\/)/, homedir()));
+		if (!existsSync(root)) throw new Error(`${root} does not exist`);
+	} else {
+		tmp = mkdtempSync(join(tmpdir(), "middleman-skill-"));
+		root = join(tmp, "repo");
+		const res = await pi.exec("git", ["clone", "--depth", "1", ...(src.ref ? ["--branch", src.ref] : []), src.url, root], { timeout: 120_000 });
+		if (res.code !== 0) {
+			rmSync(tmp, { recursive: true, force: true });
+			throw new Error(`git clone failed: ${(res.stderr || res.stdout).trim()}`);
+		}
+	}
+	try {
+		const { skills, diagnostics } = root.endsWith(".md")
+			? loadSkillsFromDir({ dir: dirname(root), source: "middleman" })
+			: loadSkillsFromDir({ dir: root, source: "middleman" });
+		const found = root.endsWith(".md") ? skills.filter((s) => s.filePath === root) : skills;
+		if (!found.length) throw new Error(`no skills found${diagnostics.length ? `: ${diagnostics.map((d) => d.message).join("; ")}` : ""}`);
+		const clashes = found.filter((s) => existsSync(join(target, s.name))).map((s) => s.name);
+		if (clashes.length && !(await ctx.ui.confirm("Overwrite skills?", `Already installed: ${clashes.join(", ")}`))) {
+			throw new Error("cancelled, nothing installed");
+		}
+		mkdirSync(target, { recursive: true });
+		for (const skill of found) {
+			const dest = join(target, skill.name);
+			rmSync(dest, { recursive: true, force: true });
+			if (basename(skill.filePath) === "SKILL.md") {
+				cpSync(skill.baseDir, dest, { recursive: true, filter: (p) => basename(p) !== ".git" });
+			} else {
+				mkdirSync(dest);
+				cpSync(skill.filePath, join(dest, "SKILL.md"));
+			}
+		}
+		return found.map((s) => s.name);
+	} finally {
+		if (tmp) rmSync(tmp, { recursive: true, force: true });
+	}
+}
+
+function skillBlock(skill: Skill): string {
+	const body = stripFrontmatter(readFileSync(skill.filePath, "utf8")).trim();
+	return `<skill name="${skill.name}" location="${skill.filePath}">\nReferences are relative to ${skill.baseDir}.\n\n${body}\n</skill>`;
 }
 
 const NAV_KEYS = ["tui.select.up", "tui.select.down", "tui.select.confirm", "tui.select.cancel"] as const;
@@ -165,6 +265,12 @@ export default function (pi: ExtensionAPI) {
 		return new Text(`${theme.fg("accent", "⇄ ")}${body}`, 1, 0);
 	});
 
+	pi.registerMessageRenderer<{ names: string[] }>(SKILLS_TYPE, (message, { expanded }, theme) => {
+		const names = message.details?.names ?? [];
+		const body = expanded && typeof message.content === "string" ? `\n${message.content}` : "";
+		return new Text(`${theme.fg("accent", "✦ ")}${theme.fg("dim", `middleman loaded skills: ${names.join(", ")}`)}${body}`, 1, 0);
+	});
+
 	let session: Layer = {};
 	let project: { path: string; layer?: Layer; error?: string } | undefined;
 	const loadProject = (ctx: ExtensionContext) => {
@@ -184,7 +290,9 @@ export default function (pi: ExtensionAPI) {
 	const showStatus = (ctx: ExtensionContext, cfg?: MiddlemanConfig, layers?: Layers) => {
 		if (!cfg) return ctx.ui.setStatus("middleman", "mm:config error");
 		const proj = layers?.project && Object.keys(layers.project).length ? " [proj]" : "";
-		ctx.ui.setStatus("middleman", cfg.enabled ? `mm:${cfg.model ?? "?"}${cfg.approval === "auto" ? " auto" : ""}${proj}` : undefined);
+		ctx.ui.setStatus("middleman", cfg.enabled || cfg.skillRouting
+				? `mm:${cfg.model ?? "?"}${cfg.enabled ? "" : " skills-only"}${cfg.enabled && cfg.approval === "auto" ? " auto" : ""}${cfg.enabled && cfg.skillRouting ? " +skills" : ""}${proj}`
+				: undefined);
 	};
 	const refreshStatus = (ctx: ExtensionContext) => {
 		try {
@@ -221,6 +329,54 @@ export default function (pi: ExtensionAPI) {
 		refreshStatus(ctx);
 	});
 
+	const skillDirs = () => ({
+		...(project && !project.error && { project: join(dirname(project.path), "middleman-skills") }),
+		global: GLOBAL_SKILLS,
+	});
+
+	pi.registerCommand("middleman-skill", {
+		description: "Manage middleman skills: install <source> [--project] | list | remove <name> [--project]",
+		getArgumentCompletions: (prefix) => {
+			const [sub, ...rest] = prefix.split(/\s+/);
+			if (rest.length) return null;
+			return ["install", "list", "remove"].filter((c) => c.startsWith(sub)).map((c) => ({ value: `${c} `, label: c }));
+		},
+		handler: async (args, ctx) => {
+			const words = args.trim().split(/\s+/).filter(Boolean);
+			const scoped = words.includes("--project");
+			const [sub, arg] = words.filter((w) => w !== "--project");
+			const dirs = skillDirs();
+			const target = scoped ? dirs.project : dirs.global;
+			if (scoped && !target) return ctx.ui.notify("Project skills need a repo you explicitly trusted in pi (not your home dir)", "error");
+			if (sub === "list") {
+				const lines = Object.entries(dirs).flatMap(([scope, dir]) =>
+					loadSkillsFromDir({ dir, source: "middleman" }).skills.map((s) => `${s.name} (${scope}) — ${s.description.replace(/\s+/g, " ").slice(0, 80)}`),
+				);
+				return ctx.ui.notify(lines.length ? lines.join("\n") : `No middleman skills. Install with /middleman-skill install <source>`, "info");
+			}
+			if (sub === "remove" && arg && target) {
+				const dest = join(target, arg);
+				if (basename(arg) !== arg || !existsSync(join(dest, "SKILL.md"))) return ctx.ui.notify(`No skill "${arg}" in ${target}`, "error");
+				rmSync(dest, { recursive: true, force: true });
+				return ctx.ui.notify(`Removed middleman skill ${arg}`, "info");
+			}
+			if (sub === "install" && arg && target) {
+				try {
+					const names = await installSkills(pi, ctx, arg, target);
+					let routing = " (turn on Skill routing in /middleman to use them)";
+					try {
+						if (resolve().cfg.skillRouting) routing = "";
+					} catch {}
+					ctx.ui.notify(`Installed ${names.join(", ")} to ${target}${routing}`, "info");
+				} catch (e) {
+					ctx.ui.notify(`Skill install failed: ${(e as Error).message}`, "error");
+				}
+				return;
+			}
+			ctx.ui.notify("Usage: /middleman-skill install <git-url|user/repo|path> [--project] | list | remove <name> [--project]", "error");
+		},
+	});
+
 	pi.registerCommand("middleman", {
 		description: "Configure the prompt middleman",
 		handler: async (_args, ctx) => {
@@ -230,6 +386,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			const show = {
 				enabled: (c: Layer) => (c.enabled ? "on" : "off"),
+				skillRouting: (c: Layer) => (c.skillRouting ? "on" : "off"),
 				model: (c: Layer) => (c.provider && c.model ? `${c.provider}/${c.model}` : "(not set)"),
 				thinking: (c: Layer) => `${c.thinking}`,
 				approval: (c: Layer) => `${c.approval}`,
@@ -270,6 +427,7 @@ export default function (pi: ExtensionAPI) {
 					...(projectError && { broken: `⚠ project config broken: ${projectError} (select to re-read)` }),
 					scope: `Editing: ${scope}`,
 					enabled: label("Enabled", "enabled"),
+					skillRouting: label("Skill routing", "skillRouting"),
 					model: label("Model", "model"),
 					thinking: label("Thinking", "thinking"),
 					...(scope !== "project" && { approval: label("Approval", "approval") }),
@@ -295,6 +453,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				let patch: Layer = {};
 				if (key === "enabled") patch = { enabled: !(own.enabled ?? cfg.enabled) };
+				if (key === "skillRouting") patch = { skillRouting: !(own.skillRouting ?? cfg.skillRouting) };
 				if (key === "approval") patch = { approval: (own.approval ?? cfg.approval) === "ask" ? "auto" : "ask" };
 				if (key === "reset") patch = { refinePrompt: undefined };
 				if (key === "clear") patch = Object.fromEntries(Object.keys(own).map((k) => [k, undefined]));
@@ -335,15 +494,17 @@ export default function (pi: ExtensionAPI) {
 						ctx.ui.notify(`${k} is overridden by the ${s} config`, "warning");
 					}
 				}
-				if (after.cfg.enabled && !after.cfg.model) ctx.ui.notify("Pick a model or prompts will pass through unchanged", "warning");
+				if ((after.cfg.enabled || after.cfg.skillRouting) && !after.cfg.model) ctx.ui.notify("Pick a model or prompts will pass through unchanged", "warning");
 				for (const k of warned) if (k.startsWith("model:")) warned.delete(k);
 				refreshStatus(ctx);
 			}
 		},
 	});
 
+	let routeNext = false;
 	pi.on("input", async (event, ctx) => {
 		if (!event.streamingBehavior) pendingNote = undefined;
+		routeNext = !event.streamingBehavior && event.source !== "extension";
 		const userPrompt = event.source !== "extension" && !event.text.startsWith("/");
 		let state: ReturnType<typeof resolve>;
 		try {
@@ -398,5 +559,51 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify(`Middleman error, sending original: ${(e as Error).message}`, "error");
 			return { action: "continue" };
 		}
+	});
+	pi.on("before_agent_start", async (event, ctx) => {
+		const fromUser = routeNext;
+		routeNext = false;
+		if (!fromUser || event.messageType !== "user" || event.images?.length || event.prompt.startsWith("<skill ")) return;
+		let cfg: MiddlemanConfig;
+		try {
+			const state = resolve();
+			if (state.projectError) return;
+			cfg = state.cfg;
+		} catch {
+			return;
+		}
+		if (!cfg.skillRouting) return;
+		const model = resolveModel(ctx, cfg);
+		if (!model) {
+			warnOnce(ctx, `model:${cfg.provider}/${cfg.model}`, "Middleman has no valid model (/middleman), skipping skill routing");
+			return;
+		}
+		const skills = loadRoutedSkills(Object.values(skillDirs()));
+		if (!skills.length) return;
+		const res = ctx.mode === "tui" ? await routeWithLoader(ctx, model, cfg, skills, event.prompt) : await routeSkills(ctx, model, cfg, skills, event.prompt);
+		if (res.kind === "cancelled") return;
+		if (res.kind === "failed") return void ctx.ui.notify(`Middleman skill routing failed, sending without skills: ${res.error}`, "warning");
+		const loaded = new Set(
+			ctx.sessionManager
+				.buildContextEntries()
+				.flatMap((e) => (e.type === "custom_message" && e.customType === SKILLS_TYPE ? ((e.details as { names?: string[] })?.names ?? []) : [])),
+		);
+		const blocks = res.picked.filter((s) => !loaded.has(s.name)).flatMap((s) => {
+			try {
+				return [{ name: s.name, block: skillBlock(s) }];
+			} catch (e) {
+				ctx.ui.notify(`Middleman could not read skill ${s.name}: ${(e as Error).message}`, "warning");
+				return [];
+			}
+		});
+		if (!blocks.length) return;
+		return {
+			message: {
+				customType: SKILLS_TYPE,
+				content: blocks.map((b) => b.block).join("\n\n"),
+				display: true,
+				details: { names: blocks.map((b) => b.name) },
+			},
+		};
 	});
 }

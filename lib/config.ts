@@ -11,6 +11,7 @@ export interface MiddlemanConfig {
 	thinking: ThinkingSetting;
 	refinePrompt: string;
 	approval: ApprovalMode;
+	skillRouting: boolean;
 }
 
 export const THINKING_LEVELS: ThinkingSetting[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
@@ -21,6 +22,7 @@ export const DEFAULT_CONFIG: MiddlemanConfig = {
 	thinking: "off",
 	refinePrompt: "Make the prompt clearer and more concise while preserving every requirement and constraint.",
 	approval: "ask",
+	skillRouting: false,
 };
 
 export class ConfigError extends Error {}
@@ -53,6 +55,7 @@ export function parseLayer(raw: unknown, path: string): Layer {
 		...(THINKING_LEVELS.includes(r.thinking as ThinkingSetting) && { thinking: r.thinking as ThinkingSetting }),
 		...(nonEmpty(r.refinePrompt) && { refinePrompt: r.refinePrompt }),
 		...(APPROVAL_MODES.includes(r.approval as ApprovalMode) && { approval: r.approval as ApprovalMode }),
+		...(typeof r.skillRouting === "boolean" && { skillRouting: r.skillRouting }),
 	};
 }
 

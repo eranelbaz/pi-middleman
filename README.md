@@ -17,6 +17,7 @@ pi install git:github.com/eranelbaz/pi-middleman
 | Setting | Values | Description |
 | --- | --- | --- |
 | Enabled | on / off | Turn rewriting on or off |
+| Skill routing | on / off | Let the middleman pick skills to load per prompt (see [Skill routing](#skill-routing)) |
 | Model | any model with working auth | The middleman model |
 | Thinking | off, minimal, low, medium, high, xhigh, max | Reasoning effort for the middleman |
 | Approval | ask / auto | Review each rewrite, or send it right away |
@@ -26,6 +27,31 @@ pi install git:github.com/eranelbaz/pi-middleman
 | Clear overrides | — | Remove every key from the edited layer |
 
 Changes are saved right away and apply to the next prompt without `/reload`. When enabled, the footer shows `mm:<model>` (plus `auto` in auto mode).
+
+## Skill routing
+
+Instead of installing skills into pi (where every skill's description goes into every system prompt), put them in a middleman skills folder:
+
+- global: `~/.pi/agent/middleman-skills/<name>/SKILL.md`
+- project: `<cwd>/.pi/middleman-skills/<name>/SKILL.md` (trusted repos only, same rules as project config; wins on name clashes)
+
+Manage them with `/middleman-skill` (not `pi install`, so they stay out of pi's system prompt):
+
+```text
+/middleman-skill install user/repo            # GitHub shorthand, optional @ref
+/middleman-skill install git:gitlab.com/a/b   # any git URL (https, ssh, git@…)
+/middleman-skill install ./path/to/skills     # local folder or single .md file
+/middleman-skill list
+/middleman-skill remove <name>
+```
+
+Add `--project` to install into or remove from the project folder. Install finds every skill in the source (folders with `SKILL.md`, using pi's discovery rules) and copies each into its own folder named after the skill, asking before overwriting. Git sources are shallow-cloned to a temp dir and discarded afterwards; there is no update command yet, so reinstall to update.
+
+With **Skill routing** on, each prompt you send is shown to the middleman model together with the list of skill names and descriptions. It picks up to 3 relevant skills (often none), and their full `SKILL.md` bodies are injected as a message before the agent runs, shown as a collapsed `✦ middleman loaded skills: …` line. Skills already loaded earlier in the current branch are not injected again.
+
+Routing works independently of rewriting (it uses the same model and thinking setting) and runs on the final prompt, after any rewrite. It is skipped for prompts with images, `/skill:` invocations, steers/follow-ups typed while the agent is streaming, and prompts sent by other extensions. Pressing `Esc` while skills are being picked skips routing for that prompt. If routing fails or takes longer than 20 seconds, the prompt is sent without skills and a warning is shown. After compaction, a skill whose body was summarized away can be loaded again.
+
+With routing on, the footer shows `+skills` (or `skills-only` when rewriting is off).
 
 ## Review keys
 
