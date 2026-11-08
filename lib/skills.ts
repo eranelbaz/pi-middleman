@@ -34,15 +34,26 @@ export function parsePicks<S extends Skill>(raw: string, skills: S[]): S[] | und
 
 export type SkillSource = { kind: "git"; url: string; ref?: string } | { kind: "path"; path: string };
 
-export function parseSource(raw: string): SkillSource {
+const REF = /^[\w.][\w./-]*$/;
+
+export function parseSource(raw: string, exists: (relPath: string) => boolean = () => false): SkillSource {
 	const src = raw.trim();
 	const git = src.startsWith("git:") ? src.slice(4) : /^(https?|ssh|git):\/\/|^git@/.test(src) ? src : undefined;
 	if (git === undefined) {
-		if (/^[\w.-]+\/[\w.-]+(@[\w./-]+)?$/.test(src) && !src.startsWith(".")) return parseSource(`git:github.com/${src}`);
-		return { kind: "path", path: src };
+		const shorthand = /^\w[\w.-]*\/[\w.-]+(@[\w./-]+)?$/.test(src) && !/\.md$/i.test(src) && !exists(src);
+		return shorthand ? parseSource(`git:github.com/${src}`) : { kind: "path", path: src };
 	}
-	const at = git.match(/^(.*?[^@/:]+?)@([\w./-]+)$/);
-	const [base, ref] = at && !/^git@[^/:]+$/.test(at[1]) ? [at[1], at[2]] : [git, undefined];
-	const url = /^[\w.-]+\.\w+\//.test(base) ? `https://${base}` : base;
+	const scheme = git.indexOf("://");
+	const pathStart = scheme !== -1 ? git.indexOf("/", scheme + 3) : /^[^/]+@[^/:]+:/.test(git) ? git.indexOf(":") + 1 : git.indexOf("/");
+	const at = pathStart === -1 ? -1 : git.indexOf("@", pathStart);
+	const base = at === -1 ? git : git.slice(0, at);
+	const ref = at === -1 ? undefined : git.slice(at + 1);
+	if (!base || base.startsWith("-")) throw new Error(`invalid git source "${raw}"`);
+	if (ref !== undefined && (!REF.test(ref) || /\.\.|\/\/|\.lock$|[./]$/.test(ref))) throw new Error(`invalid git ref "${ref}"`);
+	const url = /^[\w.-]+\.\w+(:\d+)?\//.test(base) ? `https://${base}` : base;
 	return { kind: "git", url, ...(ref && { ref }) };
+}
+
+export function isValidSkillName(name: string): boolean {
+	return name.length <= 64 && /^[a-z0-9]+(-[a-z0-9]+)*$/.test(name);
 }

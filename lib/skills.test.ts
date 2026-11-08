@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@jest/globals";
-import { buildRouteContext, MAX_PICKS, parsePicks, parseSource, ROUTER_FRAMING } from "./skills.ts";
+import { buildRouteContext, isValidSkillName, MAX_PICKS, parsePicks, parseSource, ROUTER_FRAMING } from "./skills.ts";
 
 const skills = ["a", "b", "c", "d"].map((name) => ({ name, description: `about ${name}\n  wrapped` }));
 
@@ -44,5 +44,41 @@ describe("parseSource", () => {
 		expect(parseSource("https://github.com/a/b@main")).toEqual({ kind: "git", url: "https://github.com/a/b", ref: "main" });
 		expect(parseSource("git@github.com:a/b.git")).toEqual({ kind: "git", url: "git@github.com:a/b.git" });
 		expect(parseSource("git@github.com:a/b@dev")).toEqual({ kind: "git", url: "git@github.com:a/b", ref: "dev" });
+	});
+});
+
+describe("parseSource edge cases", () => {
+	it("does not treat a URL username as a ref", () => {
+		expect(parseSource("https://user@host.com/a/b")).toEqual({ kind: "git", url: "https://user@host.com/a/b" });
+		expect(parseSource("ssh://git@host/a/b")).toEqual({ kind: "git", url: "ssh://git@host/a/b" });
+		expect(parseSource("ssh://git@host/a/b@v2")).toEqual({ kind: "git", url: "ssh://git@host/a/b", ref: "v2" });
+	});
+	it("accepts refs with slashes", () => {
+		expect(parseSource("user/repo@feature/x")).toEqual({ kind: "git", url: "https://github.com/user/repo", ref: "feature/x" });
+		expect(parseSource("https://github.com/a/b@release/1.2")).toEqual({ kind: "git", url: "https://github.com/a/b", ref: "release/1.2" });
+		expect(parseSource("git@github.com:a/b@feature/y")).toEqual({ kind: "git", url: "git@github.com:a/b", ref: "feature/y" });
+	});
+	it("adds https to host:port sources", () => {
+		expect(parseSource("git:gitlab.com:2222/a/b")).toEqual({ kind: "git", url: "https://gitlab.com:2222/a/b" });
+	});
+	it("prefers existing local paths and .md files over github shorthand", () => {
+		expect(parseSource("skills/debug", (p) => p === "skills/debug")).toEqual({ kind: "path", path: "skills/debug" });
+		expect(parseSource("docs/SKILL.md")).toEqual({ kind: "path", path: "docs/SKILL.md" });
+		expect(parseSource("skills/debug", () => false)).toEqual({ kind: "git", url: "https://github.com/skills/debug" });
+	});
+	it("rejects sources and refs that git would read as options", () => {
+		expect(() => parseSource("git:--upload-pack=x")).toThrow("invalid git source");
+		expect(() => parseSource("user/repo@-x")).toThrow("invalid git ref");
+		for (const bad of ["a..b", "a//b", "x.lock", "v1/", "v1."]) expect(() => parseSource(`user/repo@${bad}`)).toThrow("invalid git ref");
+	});
+});
+
+describe("isValidSkillName", () => {
+	it("accepts pi-style names", () => {
+		expect(isValidSkillName("systematic-debugging")).toBe(true);
+		expect(isValidSkillName("a1")).toBe(true);
+	});
+	it("rejects traversal, uppercase, bad hyphens, and long names", () => {
+		for (const bad of ["../x", "..", "a/b", "Foo", "-a", "a-", "a--b", "", "a".repeat(65)]) expect(isValidSkillName(bad)).toBe(false);
 	});
 });
