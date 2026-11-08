@@ -14,7 +14,7 @@ import {
 	type Skill,
 	stripFrontmatter,
 } from "@earendil-works/pi-coding-agent";
-import { Container, fuzzyFilter, Input, matchesKey, type SelectItem, SelectList, Spacer, Text } from "@earendil-works/pi-tui";
+import { Container, fuzzyFilter, Input, type SelectItem, SelectList, Spacer, Text } from "@earendil-works/pi-tui";
 import {
 	type Layer,
 	type MiddlemanConfig,
@@ -26,17 +26,12 @@ import {
 	sourceOf,
 	THINKING_LEVELS,
 } from "../lib/config.ts";
-import { clip } from "../lib/output.ts";
-import { type Choice, type Outcome, type Resolution, resolveChoice, toOutcome } from "../lib/outcome.ts";
-import { buildContext, extractText, reasoningFor, shouldRefine } from "../lib/refine.ts";
 import { installInto, planInstall, type SkillRef, skillName } from "../lib/install.ts";
-import { buildRouteContext, classifyRoute, isValidSkillName, parseSource, shouldRoute } from "../lib/skills.ts";
+import { buildRouteContext, classifyRoute, extractText, isValidSkillName, parseSource, reasoningFor, shouldRoute } from "../lib/skills.ts";
 
 const GLOBAL_PATH = join(getAgentDir(), "middleman.json");
 const GLOBAL_SKILLS = join(getAgentDir(), "middleman-skills");
-const NOTE_TYPE = "middleman-note";
 const SKILLS_TYPE = "middleman-skills";
-const TIMEOUT_MS = 60_000;
 const ROUTE_TIMEOUT_MS = 20_000;
 
 type Layers = Partial<Record<Scope, Layer>>;
@@ -53,35 +48,8 @@ function projectPath(ctx: ExtensionContext): string | undefined {
 	return join(ctx.cwd, ".pi", "middleman.json");
 }
 
-function readProject(path: string): Layer {
-	const { approval: _, ...layer } = readLayer(path);
-	return layer;
-}
-
 function resolveModel(ctx: ExtensionContext, cfg: MiddlemanConfig): Model | undefined {
 	return cfg.provider && cfg.model ? ctx.modelRegistry.find(cfg.provider, cfg.model) : undefined;
-}
-
-async function callMiddleman(ctx: ExtensionContext, model: Model, cfg: MiddlemanConfig, text: string, cancel?: AbortSignal): Promise<Outcome> {
-	const signal = cancel ? AbortSignal.any([cancel, AbortSignal.timeout(TIMEOUT_MS)]) : AbortSignal.timeout(TIMEOUT_MS);
-	try {
-		const res = await ctx.modelRegistry
-			.streamSimple(model, buildContext(cfg, text), { signal, maxRetries: 1, reasoning: reasoningFor(cfg) })
-			.result();
-		return toOutcome(res, text, cancel?.aborted ?? false);
-	} catch (e) {
-		if (cancel?.aborted) return { kind: "cancelled" };
-		return { kind: "failed", error: e instanceof Error ? e.message : String(e) };
-	}
-}
-
-function refineWithLoader(ctx: ExtensionContext, model: Model, cfg: MiddlemanConfig, text: string): Promise<Outcome> {
-	return ctx.ui.custom<Outcome>((tui, theme, _kb, done) => {
-		const loader = new BorderedLoader(tui, theme, `Middleman refining with ${cfg.provider}/${cfg.model}...`);
-		loader.onAbort = () => done({ kind: "cancelled" });
-		callMiddleman(ctx, model, cfg, text, loader.signal).then(done);
-		return loader;
-	});
 }
 
 type Route = { kind: "ok"; picked: Skill[] } | { kind: "failed"; error: string } | { kind: "cancelled" };
@@ -108,50 +76,6 @@ function routeWithLoader(ctx: ExtensionContext, model: Model, cfg: MiddlemanConf
 		routeSkills(ctx, model, cfg, skills, prompt, loader.signal).then(done);
 		return loader;
 	});
-}
-
-function review(ctx: ExtensionContext, original: string, refined: string): Promise<Choice | "edit"> {
-	return ctx.ui.custom<Choice | "edit">((tui, theme, kb, done) => {
-		let full = false;
-		const show = (s: string) => (full ? s : clip(s));
-		const before = new Text(theme.fg("dim", show(original)), 1, 0);
-		const after = new Text(show(refined), 1, 0);
-		const root = new Container();
-		root.addChild(new Text(theme.bold(theme.fg("accent", "Middleman: review prompt")), 1, 0));
-		root.addChild(
-			new Text(theme.fg("dim", "[a/enter] approve   [e] edit   [u] send user prompt   [f] full text   [r/esc] reject"), 1, 0),
-		);
-		root.addChild(new Spacer(1));
-		root.addChild(new Text(theme.fg("muted", "Before"), 1, 0));
-		root.addChild(before);
-		root.addChild(new Spacer(1));
-		root.addChild(new Text(theme.fg("muted", "After"), 1, 0));
-		root.addChild(after);
-		return Object.assign(root, {
-			handleInput(data: string) {
-				if (matchesKey(data, "a") || kb.matches(data, "tui.select.confirm")) done("approve");
-				else if (matchesKey(data, "e")) done("edit");
-				else if (matchesKey(data, "u")) done("original");
-				else if (matchesKey(data, "r") || kb.matches(data, "tui.select.cancel")) done("reject");
-				else if (matchesKey(data, "f")) {
-					full = !full;
-					before.setText(theme.fg("dim", show(original)));
-					after.setText(show(refined));
-					tui.requestRender();
-				}
-			},
-		});
-	});
-}
-
-async function reviewLoop(ctx: ExtensionContext, original: string, refined: string): Promise<{ choice: Choice; text: string }> {
-	let text = refined;
-	while (true) {
-		const choice = await review(ctx, original, text);
-		if (choice !== "edit") return { choice, text };
-		const edited = await ctx.ui.editor("Edit rewritten prompt", text);
-		if (edited?.trim()) text = edited;
-	}
 }
 
 function loadRoutedSkills(dirs: string[]): Skill[] {
@@ -281,15 +205,6 @@ async function pick(ctx: ExtensionContext, title: string, labels: string[], curr
 }
 
 export default function (pi: ExtensionAPI) {
-	pi.registerEntryRenderer<{ before: string; after: string }>(NOTE_TYPE, (entry, { expanded }, theme) => {
-		if (!entry.data) return undefined;
-		const { before, after } = entry.data;
-		const body = expanded
-			? `${theme.fg("muted", "Before:")}\n${before}\n\n${theme.fg("muted", "After:")}\n${after}`
-			: theme.fg("dim", `middleman rewrote prompt (${before.length} → ${after.length} chars) — expand to view`);
-		return new Text(`${theme.fg("accent", "⇄ ")}${body}`, 1, 0);
-	});
-
 	pi.registerMessageRenderer<{ names: string[] }>(SKILLS_TYPE, (message, { expanded }, theme) => {
 		const names = message.details?.names ?? [];
 		const body = expanded && typeof message.content === "string" ? `\n${message.content}` : "";
@@ -302,7 +217,7 @@ export default function (pi: ExtensionAPI) {
 		const path = projectPath(ctx);
 		if (!path) return void (project = undefined);
 		try {
-			project = { path, layer: readProject(path) };
+			project = { path, layer: readLayer(path) };
 		} catch (e) {
 			project = { path, error: (e as Error).message };
 		}
@@ -315,9 +230,7 @@ export default function (pi: ExtensionAPI) {
 	const showStatus = (ctx: ExtensionContext, cfg?: MiddlemanConfig, layers?: Layers) => {
 		if (!cfg) return ctx.ui.setStatus("middleman", "mm:config error");
 		const proj = layers?.project && Object.keys(layers.project).length ? " [proj]" : "";
-		ctx.ui.setStatus("middleman", cfg.enabled || cfg.skillRouting
-				? `mm:${cfg.model ?? "?"}${cfg.enabled ? "" : " skills-only"}${cfg.enabled && cfg.approval === "auto" ? " auto" : ""}${cfg.enabled && cfg.skillRouting ? " +skills" : ""}${proj}`
-				: undefined);
+		ctx.ui.setStatus("middleman", cfg.skillRouting ? `mm:${cfg.model ?? "?"}${proj}` : undefined);
 	};
 	const refreshStatus = (ctx: ExtensionContext) => {
 		try {
@@ -335,20 +248,8 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.notify(message, "warning");
 	};
 
-	let pendingNote: { before: string; after: string } | undefined;
-	const flushNote = () => {
-		if (!pendingNote) return;
-		pi.appendEntry(NOTE_TYPE, pendingNote);
-		pendingNote = undefined;
-	};
-	pi.on("message_start", async (event) => {
-		if (event.message.role === "assistant") flushNote();
-	});
-	pi.on("agent_end", async () => flushNote());
-
 	pi.on("session_start", async (_event, ctx) => {
 		warned.clear();
-		pendingNote = undefined;
 		session = {};
 		loadProject(ctx);
 		refreshStatus(ctx);
@@ -403,22 +304,16 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("middleman", {
-		description: "Configure the prompt middleman",
+		description: "Configure the middleman skill router",
 		handler: async (_args, ctx) => {
 			if (!ctx.hasUI) {
 				ctx.ui.notify("/middleman requires interactive mode", "error");
 				return;
 			}
 			const show = {
-				enabled: (c: Layer) => (c.enabled ? "on" : "off"),
 				skillRouting: (c: Layer) => (c.skillRouting ? "on" : "off"),
 				model: (c: Layer) => (c.provider && c.model ? `${c.provider}/${c.model}` : "(not set)"),
 				thinking: (c: Layer) => `${c.thinking}`,
-				approval: (c: Layer) => `${c.approval}`,
-				refinePrompt: (c: Layer) => {
-					const line = (c.refinePrompt ?? "").replace(/\s+/g, " ").trim();
-					return `${line.slice(0, 50)}${line.length > 50 ? "…" : ""}`;
-				},
 			};
 			const write = (scope: Scope, patch: Layer) => {
 				if (scope === "session") {
@@ -451,13 +346,9 @@ export default function (pi: ExtensionAPI) {
 				const items = {
 					...(projectError && { broken: `⚠ project config broken: ${projectError} (select to re-read)` }),
 					scope: `Editing: ${scope}`,
-					enabled: label("Enabled", "enabled"),
 					skillRouting: label("Skill routing", "skillRouting"),
 					model: label("Model", "model"),
 					thinking: label("Thinking", "thinking"),
-					...(scope !== "project" && { approval: label("Approval", "approval") }),
-					prompt: label("Refine prompt", "refinePrompt"),
-					...(own.refinePrompt !== undefined && { reset: `Reset refine prompt (${scope})` }),
 					...(Object.keys(own).length && { clear: `Clear ${scope} overrides` }),
 				};
 				const choice = await pick(ctx, "Middleman", Object.values(items), last && (items as Record<string, string | undefined>)[last]);
@@ -477,10 +368,7 @@ export default function (pi: ExtensionAPI) {
 					continue;
 				}
 				let patch: Layer = {};
-				if (key === "enabled") patch = { enabled: !(own.enabled ?? cfg.enabled) };
 				if (key === "skillRouting") patch = { skillRouting: !(own.skillRouting ?? cfg.skillRouting) };
-				if (key === "approval") patch = { approval: (own.approval ?? cfg.approval) === "ask" ? "auto" : "ask" };
-				if (key === "reset") patch = { refinePrompt: undefined };
 				if (key === "clear") patch = Object.fromEntries(Object.keys(own).map((k) => [k, undefined]));
 				if (key === "thinking") {
 					const t = await pick(ctx, "Thinking effort", THINKING_LEVELS, own.thinking ?? cfg.thinking);
@@ -499,10 +387,6 @@ export default function (pi: ExtensionAPI) {
 					const chosen = m === undefined ? undefined : models[labels.indexOf(m)];
 					if (chosen) patch = { provider: chosen.provider, model: chosen.id };
 				}
-				if (key === "prompt") {
-					const p = await ctx.ui.editor("Refine prompt", own.refinePrompt ?? cfg.refinePrompt);
-					if (p?.trim()) patch = { refinePrompt: p };
-				}
 				const keys = Object.keys(patch) as (keyof MiddlemanConfig)[];
 				if (keys.every((k) => own[k] === patch[k])) continue;
 				let after: ReturnType<typeof resolve>;
@@ -519,7 +403,7 @@ export default function (pi: ExtensionAPI) {
 						ctx.ui.notify(`${k} is overridden by the ${s} config`, "warning");
 					}
 				}
-				if ((after.cfg.enabled || after.cfg.skillRouting) && !after.cfg.model) ctx.ui.notify("Pick a model or prompts will pass through unchanged", "warning");
+				if (after.cfg.skillRouting && !after.cfg.model) ctx.ui.notify("Pick a model or skills will not be loaded", "warning");
 				for (const k of warned) if (k.startsWith("model:")) warned.delete(k);
 				refreshStatus(ctx);
 			}
@@ -528,62 +412,19 @@ export default function (pi: ExtensionAPI) {
 
 	let routeNext = false;
 	pi.on("input", async (event, ctx) => {
-		if (!event.streamingBehavior) pendingNote = undefined;
 		routeNext = !event.streamingBehavior && event.source !== "extension";
-		const userPrompt = event.source !== "extension" && !event.text.startsWith("/");
-		let state: ReturnType<typeof resolve>;
+		const userPrompt = routeNext && !event.text.startsWith("/");
 		try {
-			state = resolve();
+			const { cfg, layers, projectError } = resolve();
+			if (projectError) {
+				showStatus(ctx, undefined);
+				if (userPrompt) warnOnce(ctx, "config:project", `Middleman config unreadable, skipping skill routing: ${projectError}`);
+			} else showStatus(ctx, cfg, layers);
 		} catch (e) {
 			showStatus(ctx, undefined);
-			if (userPrompt) warnOnce(ctx, "config:global", `Middleman config unreadable, passing prompts through: ${(e as Error).message}`);
-			return { action: "continue" };
+			if (userPrompt) warnOnce(ctx, "config:global", `Middleman config unreadable, skipping skill routing: ${(e as Error).message}`);
 		}
-		const { cfg, layers, projectError } = state;
-		if (projectError) {
-			showStatus(ctx, undefined);
-			if (userPrompt) warnOnce(ctx, "config:project", `Middleman config unreadable, passing prompts through: ${projectError}`);
-			return { action: "continue" };
-		}
-		showStatus(ctx, cfg, layers);
-		if (!shouldRefine(event, cfg)) return { action: "continue" };
-
-		const model = resolveModel(ctx, cfg);
-		if (!model) {
-			warnOnce(ctx, `model:${cfg.provider}/${cfg.model}`, "Middleman has no valid model (/middleman), sending prompts unchanged");
-			return { action: "continue" };
-		}
-
-		const tui = ctx.mode === "tui";
-		try {
-			const outcome = tui ? await refineWithLoader(ctx, model, cfg, event.text) : await callMiddleman(ctx, model, cfg, event.text);
-			if (outcome.kind === "cancelled") {
-				ctx.ui.setEditorText(event.text);
-				return { action: "handled" };
-			}
-			if (outcome.kind === "failed") {
-				const hint = ctx.modelRegistry.hasConfiguredAuth(model) ? "" : ` (no working auth for ${cfg.provider}?)`;
-				ctx.ui.notify(`Middleman failed, sending original: ${outcome.error}${hint}`, "warning");
-				return { action: "continue" };
-			}
-
-			if (outcome.text === event.text) return { action: "continue" };
-
-			let res: Resolution = { action: "transform", text: outcome.text };
-			if (cfg.approval === "ask" && tui) {
-				const { choice, text } = await reviewLoop(ctx, event.text, outcome.text);
-				res = resolveChoice(choice, event.text, text);
-			}
-			if (res.action === "handled") {
-				ctx.ui.setEditorText(res.restore);
-				return { action: "handled" };
-			}
-			if (res.action === "transform") pendingNote = { before: event.text, after: res.text };
-			return res;
-		} catch (e) {
-			ctx.ui.notify(`Middleman error, sending original: ${(e as Error).message}`, "error");
-			return { action: "continue" };
-		}
+		return { action: "continue" };
 	});
 	pi.on("before_agent_start", async (event, ctx) => {
 		const fromUser = routeNext;

@@ -2,26 +2,18 @@ import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node
 import { dirname } from "node:path";
 
 export type ThinkingSetting = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-export type ApprovalMode = "auto" | "ask";
 
 export interface MiddlemanConfig {
-	enabled: boolean;
 	provider?: string;
 	model?: string;
 	thinking: ThinkingSetting;
-	refinePrompt: string;
-	approval: ApprovalMode;
 	skillRouting: boolean;
 }
 
 export const THINKING_LEVELS: ThinkingSetting[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-const APPROVAL_MODES: ApprovalMode[] = ["auto", "ask"];
 
 export const DEFAULT_CONFIG: MiddlemanConfig = {
-	enabled: false,
 	thinking: "off",
-	refinePrompt: "Make the prompt clearer and more concise while preserving every requirement and constraint.",
-	approval: "ask",
 	skillRouting: false,
 };
 
@@ -50,11 +42,8 @@ export function parseLayer(raw: unknown, path: string): Layer {
 	if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new ConfigError(`${path}: not a JSON object`);
 	const r = raw as Record<string, unknown>;
 	return {
-		...(typeof r.enabled === "boolean" && { enabled: r.enabled }),
 		...(nonEmpty(r.provider) && nonEmpty(r.model) && { provider: r.provider, model: r.model }),
 		...(THINKING_LEVELS.includes(r.thinking as ThinkingSetting) && { thinking: r.thinking as ThinkingSetting }),
-		...(nonEmpty(r.refinePrompt) && { refinePrompt: r.refinePrompt }),
-		...(APPROVAL_MODES.includes(r.approval as ApprovalMode) && { approval: r.approval as ApprovalMode }),
 		...(typeof r.skillRouting === "boolean" && { skillRouting: r.skillRouting }),
 	};
 }

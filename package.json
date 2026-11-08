@@ -1,7 +1,7 @@
 {
   "name": "pi-middleman",
   "version": "0.1.0",
-  "description": "A Pi extension that rewrites every prompt with a configurable middleman model before sending it, with optional before/after approval",
+  "description": "A Pi extension where a small middleman model picks which skills to load for each prompt, keeping them out of every system prompt",
   "author": "Eran Elbaz",
   "license": "MIT",
   "homepage": "https://github.com/eranelbaz/pi-middleman#readme",
@@ -12,8 +12,8 @@
   "keywords": [
     "pi-package",
     "pi-extension",
-    "prompt",
-    "rewrite"
+    "skills",
+    "router"
   ],
   "type": "module",
   "engines": {

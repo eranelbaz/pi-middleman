@@ -1,4 +1,5 @@
-import type { Context } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Context, ThinkingLevel } from "@earendil-works/pi-ai";
+import type { MiddlemanConfig } from "./config.ts";
 
 type Skill = { name: string; description: string };
 
@@ -22,6 +23,17 @@ export function buildRouteContext(skills: Skill[], prompt: string): Context {
 			},
 		],
 	};
+}
+
+export function reasoningFor(cfg: MiddlemanConfig): ThinkingLevel | undefined {
+	return cfg.thinking === "off" ? undefined : cfg.thinking;
+}
+
+export function extractText(msg: AssistantMessage): string {
+	return msg.content
+		.filter((c): c is { type: "text"; text: string } => c.type === "text")
+		.map((c) => c.text)
+		.join("");
 }
 
 export function parsePicks<S extends { name: string }>(raw: string, skills: S[]): S[] | undefined {

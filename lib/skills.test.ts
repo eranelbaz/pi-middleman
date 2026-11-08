@@ -1,5 +1,7 @@
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "@jest/globals";
-import { buildRouteContext, classifyRoute, isValidSkillName, MAX_PICKS, parsePicks, parseSource, ROUTER_FRAMING, shouldRoute } from "./skills.ts";
+import { DEFAULT_CONFIG } from "./config.ts";
+import { buildRouteContext, classifyRoute, extractText, isValidSkillName, MAX_PICKS, parsePicks, parseSource, reasoningFor, ROUTER_FRAMING, shouldRoute } from "./skills.ts";
 
 const skills = ["a", "b", "c", "d"].map((name) => ({ name, description: `about ${name}\n  wrapped` }));
 
@@ -121,5 +123,19 @@ describe("classifyRoute", () => {
 	});
 	it("reports missing picked tags", () => {
 		expect(classifyRoute({ stopReason: "stop", text: "a" }, skills, false, false, 30000)).toEqual({ kind: "failed", error: "no <picked> output" });
+	});
+});
+
+describe("reasoningFor", () => {
+	it("maps off to undefined and passes others through", () => {
+		expect(reasoningFor({ ...DEFAULT_CONFIG, thinking: "off" })).toBeUndefined();
+		expect(reasoningFor({ ...DEFAULT_CONFIG, thinking: "high" })).toBe("high");
+	});
+});
+
+describe("extractText", () => {
+	it("joins text parts and ignores thinking", () => {
+		const msg = { content: [{ type: "thinking", thinking: "hmm" }, { type: "text", text: "<picked>a" }, { type: "text", text: "</picked>" }] } as unknown as AssistantMessage;
+		expect(extractText(msg)).toBe("<picked>a</picked>");
 	});
 });
