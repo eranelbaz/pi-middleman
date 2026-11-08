@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync }
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve as resolvePath } from "node:path";
 import { promisify } from "node:util";
+import { Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	BorderedLoader,
@@ -32,6 +33,7 @@ import { buildRouteContext, classifyRoute, extractText, isValidSkillName, parseS
 const GLOBAL_PATH = join(getAgentDir(), "middleman.json");
 const GLOBAL_SKILLS = join(getAgentDir(), "middleman-skills");
 const SKILLS_TYPE = "middleman-skills";
+const SKILL_TOOL = "middleman_skill";
 const ROUTE_TIMEOUT_MS = 20_000;
 
 type Layers = Partial<Record<Scope, Layer>>;
@@ -253,6 +255,7 @@ export default function (pi: ExtensionAPI) {
 		session = {};
 		loadProject(ctx);
 		refreshStatus(ctx);
+		syncSkillTool(ctx);
 	});
 
 	const skillDirs = () => ({
@@ -426,19 +429,79 @@ export default function (pi: ExtensionAPI) {
 		}
 		return { action: "continue" };
 	});
+	const routingConfig = (): MiddlemanConfig | undefined => {
+		try {
+			const state = resolve();
+			return state.projectError || !state.cfg.skillRouting ? undefined : state.cfg;
+		} catch {
+			return undefined;
+		}
+	};
+	const newBlocks = (ctx: ExtensionContext, picked: Skill[]) => {
+		const loaded = new Set(
+			ctx.sessionManager.buildContextEntries().flatMap((e) => {
+				if (e.type === "custom_message" && e.customType === SKILLS_TYPE) return (e.details as { names?: string[] })?.names ?? [];
+				if (e.type === "message" && e.message.role === "toolResult" && e.message.toolName === SKILL_TOOL) return (e.message.details as { names?: string[] })?.names ?? [];
+				return [];
+			}),
+		);
+		return picked.filter((s) => !loaded.has(s.name)).flatMap((s) => {
+			try {
+				return [{ name: s.name, block: skillBlock(s) }];
+			} catch (e) {
+				ctx.ui.notify(`Middleman could not read skill ${s.name}: ${(e as Error).message}`, "warning");
+				return [];
+			}
+		});
+	};
+
+	pi.registerTool({
+		name: SKILL_TOOL,
+		label: "Middleman skill",
+		description:
+			"Ask the middleman for skills (step-by-step instructions for specific tools, services and workflows) matching a need that came up mid-task, e.g. 'create a Linear issue' or 'write a database migration'. Returns the matching skills' instructions, or says none apply.",
+		promptSnippet: "Load skills for a need that comes up mid-task",
+		promptGuidelines: [
+			`Before using an external service or unfamiliar workflow (issue trackers, deploys, APIs) or searching MCP tools for it, call ${SKILL_TOOL} with the need; follow any skill it returns.`,
+		],
+		parameters: Type.Object({ need: Type.String({ description: "What you are about to do, in a short phrase" }) }),
+		async execute(_id, { need }, signal, onUpdate, ctx) {
+			const text = (t: string, names: string[] = []) => ({ content: [{ type: "text" as const, text: t }], details: { names } });
+			if (!need.trim()) return text("Describe the need in a short phrase.");
+			const cfg = routingConfig();
+			if (!cfg) return text("Middleman skill routing is off; no skills available.");
+			const model = resolveModel(ctx, cfg);
+			if (!model) return text("Middleman has no valid model configured; no skills available.");
+			const skills = loadRoutedSkills(Object.values(skillDirs()));
+			if (!skills.length) return text("No middleman skills are installed.");
+			onUpdate?.(text(`Middleman picking skills for "${need}"...`));
+			const res = await routeSkills(ctx, model, cfg, skills, need, signal);
+			if (res.kind === "cancelled") throw new Error("cancelled");
+			if (res.kind === "failed") return text(`Middleman skill routing failed (${res.error}). Proceed without skills; don't retry.`);
+			if (!res.picked.length) return text(`No skill matches "${need}". Proceed without one.`);
+			const blocks = newBlocks(ctx, res.picked);
+			const already = res.picked.filter((s) => !blocks.some((b) => b.name === s.name)).map((s) => s.name);
+			const note = already.length ? `Already loaded earlier in this conversation (follow them): ${already.join(", ")}` : "";
+			if (!blocks.length && !note) return text("Matching skills could not be read. Proceed without them.");
+			return text([...blocks.map((b) => b.block), note].filter(Boolean).join("\n\n"), blocks.map((b) => b.name));
+		},
+	});
+
+	const syncSkillTool = (ctx: ExtensionContext) => {
+		const cfg = routingConfig();
+		const usable = !!cfg && !!resolveModel(ctx, cfg) && loadRoutedSkills(Object.values(skillDirs())).length > 0;
+		const active = pi.getActiveTools();
+		if (usable === active.includes(SKILL_TOOL)) return;
+		pi.setActiveTools(usable ? [...active, SKILL_TOOL] : active.filter((t) => t !== SKILL_TOOL));
+	};
+
 	pi.on("before_agent_start", async (event, ctx) => {
+		syncSkillTool(ctx);
 		const fromUser = routeNext;
 		routeNext = false;
 		if (event.messageType !== "user" || !shouldRoute(fromUser, event, { skillRouting: true })) return;
-		let cfg: MiddlemanConfig;
-		try {
-			const state = resolve();
-			if (state.projectError) return;
-			cfg = state.cfg;
-		} catch {
-			return;
-		}
-		if (!shouldRoute(fromUser, event, cfg)) return;
+		const cfg = routingConfig();
+		if (!cfg) return;
 		const model = resolveModel(ctx, cfg);
 		if (!model) {
 			warnOnce(ctx, `model:${cfg.provider}/${cfg.model}`, "Middleman has no valid model (/middleman), skipping skill routing");
@@ -449,19 +512,7 @@ export default function (pi: ExtensionAPI) {
 		const res = ctx.mode === "tui" ? await routeWithLoader(ctx, model, cfg, skills, event.prompt) : await routeSkills(ctx, model, cfg, skills, event.prompt);
 		if (res.kind === "cancelled") return;
 		if (res.kind === "failed") return void ctx.ui.notify(`Middleman skill routing failed, sending without skills: ${res.error}`, "warning");
-		const loaded = new Set(
-			ctx.sessionManager
-				.buildContextEntries()
-				.flatMap((e) => (e.type === "custom_message" && e.customType === SKILLS_TYPE ? ((e.details as { names?: string[] })?.names ?? []) : [])),
-		);
-		const blocks = res.picked.filter((s) => !loaded.has(s.name)).flatMap((s) => {
-			try {
-				return [{ name: s.name, block: skillBlock(s) }];
-			} catch (e) {
-				ctx.ui.notify(`Middleman could not read skill ${s.name}: ${(e as Error).message}`, "warning");
-				return [];
-			}
-		});
+		const blocks = newBlocks(ctx, res.picked);
 		if (!blocks.length) return;
 		return {
 			message: {

@@ -43,6 +43,8 @@ With **Skill routing** on, each prompt you send is shown to the middleman model 
 
 Your prompt itself is never changed. Routing is skipped for prompts with images, `/skill:` invocations, steers/follow-ups typed while the agent is streaming, and prompts sent by other extensions. Pressing `Esc` while skills are being picked skips routing for that prompt. If routing fails or takes longer than 20 seconds, the prompt is sent without skills and a warning is shown. After compaction, a skill whose body was summarized away can be loaded again.
 
+Needs often show up mid-task (e.g. "file a ticket" while working on something else), after the prompt was already routed. For that the agent gets a `middleman_skill` tool: it describes what it's about to do, the middleman picks matching skills the same way, and their bodies come back as the tool result. The system prompt tells the agent to call it before using external services or unfamiliar workflows (or searching MCP tools for them). The tool is only active while routing is on, a model is set, and at least one middleman skill is installed. If routing fails, the tool tells the agent to continue without skills.
+
 ## Config
 
 Settings come from three layers:
