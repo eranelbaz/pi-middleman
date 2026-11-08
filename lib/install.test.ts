@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, symlinkS
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "@jest/globals";
-import { installInto, planInstall, skillName } from "./install.ts";
+import { installInto, overlaps, planInstall, skillName } from "./install.ts";
 
 const tmp = () => mkdtempSync(join(tmpdir(), "mm-install-"));
 const ref = (name: string, baseDir: string, file = "SKILL.md") => ({ name, baseDir, filePath: join(baseDir, file) });
@@ -82,5 +82,33 @@ describe("installInto", () => {
 		expect(() => installInto(target, [ref("a", good), ref("b", broken)], [])).toThrow("SKILL.md was not copied");
 		expect(readFileSync(join(target, "a", "SKILL.md"), "utf8")).toBe("old-a");
 		expect(readdirSync(target)).toEqual(["a"]);
+	});
+});
+
+describe("overlaps", () => {
+	it("detects nesting in either direction and ignores siblings", () => {
+		const root = tmp();
+		const a = skillAt(join(root, "a"));
+		const b = skillAt(join(root, "b"));
+		const inner = skillAt(join(a, "inner"));
+		expect(overlaps(a, inner)).toBe(true);
+		expect(overlaps(inner, a)).toBe(true);
+		expect(overlaps(a, a)).toBe(true);
+		expect(overlaps(a, b)).toBe(false);
+	});
+});
+
+describe("installInto extras", () => {
+	it("installs several skills and leaves no staging folder behind", () => {
+		const target = tmp();
+		const src = tmp();
+		installInto(target, [ref("a", skillAt(join(src, "a"), "A")), ref("b", skillAt(join(src, "b"), "B"))], []);
+		expect(readdirSync(target).sort()).toEqual(["a", "b"]);
+		expect(readFileSync(join(target, "b", "SKILL.md"), "utf8")).toBe("B");
+	});
+	it("creates the target directory when missing", () => {
+		const target = join(tmp(), "nested", "skills");
+		installInto(target, [ref("a", skillAt(join(tmp(), "a")))], []);
+		expect(existsSync(join(target, "a", "SKILL.md"))).toBe(true);
 	});
 });

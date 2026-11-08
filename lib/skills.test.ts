@@ -139,3 +139,16 @@ describe("extractText", () => {
 		expect(extractText(msg)).toBe("<picked>a</picked>");
 	});
 });
+
+describe("parseSource extras", () => {
+	it("trims whitespace and expands shorthand to GitHub", () => {
+		expect(parseSource("  user/repo  ")).toEqual({ kind: "git", url: "https://github.com/user/repo" });
+	});
+	it("keeps plain https urls and refs", () => {
+		expect(parseSource("https://github.com/a/b")).toEqual({ kind: "git", url: "https://github.com/a/b" });
+		expect(parseSource("git:github.com/a/b@v1")).toEqual({ kind: "git", url: "https://github.com/a/b", ref: "v1" });
+	});
+	it("rejects an empty git source", () => {
+		expect(() => parseSource("git:")).toThrow("invalid git source");
+	});
+});
