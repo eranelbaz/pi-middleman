@@ -24,12 +24,30 @@ export function buildRouteContext(skills: Skill[], prompt: string): Context {
 	};
 }
 
-export function parsePicks<S extends Skill>(raw: string, skills: S[]): S[] | undefined {
+export function parsePicks<S extends { name: string }>(raw: string, skills: S[]): S[] | undefined {
 	const end = raw.lastIndexOf("</picked>");
 	const start = end === -1 ? -1 : raw.lastIndexOf("<picked>", end);
 	if (start === -1) return undefined;
 	const names = new Set(raw.slice(start + "<picked>".length, end).split(/[,\n]/).map((n) => n.trim()));
 	return skills.filter((s) => names.has(s.name)).slice(0, MAX_PICKS);
+}
+
+export function shouldRoute(fromUser: boolean, event: { messageType: string; prompt?: string; images?: unknown[] }, cfg: { skillRouting: boolean }): boolean {
+	return fromUser && event.messageType === "user" && !event.images?.length && !event.prompt?.startsWith("<skill ") && cfg.skillRouting;
+}
+
+export function classifyRoute<S extends { name: string }>(
+	res: { stopReason: string; errorMessage?: string; text: string },
+	skills: S[],
+	cancelled: boolean,
+	timedOut: boolean,
+	timeoutMs: number,
+): { kind: "ok"; picked: S[] } | { kind: "failed"; error: string } | { kind: "cancelled" } {
+	if (cancelled) return { kind: "cancelled" };
+	if (timedOut) return { kind: "failed", error: `timed out after ${timeoutMs / 1000}s` };
+	if (res.stopReason !== "stop") return { kind: "failed", error: res.errorMessage ?? `stopped: ${res.stopReason}` };
+	const picked = parsePicks(res.text, skills);
+	return picked ? { kind: "ok", picked } : { kind: "failed", error: "no <picked> output" };
 }
 
 export type SkillSource = { kind: "git"; url: string; ref?: string } | { kind: "path"; path: string };
@@ -40,7 +58,7 @@ export function parseSource(raw: string, exists: (relPath: string) => boolean = 
 	const src = raw.trim();
 	const git = src.startsWith("git:") ? src.slice(4) : /^(https?|ssh|git):\/\/|^git@/.test(src) ? src : undefined;
 	if (git === undefined) {
-		const shorthand = /^\w[\w.-]*\/[\w.-]+(@[\w./-]+)?$/.test(src) && !/\.md$/i.test(src) && !exists(src);
+		const shorthand = /^\w[\w.-]*\/[\w.-]+(@[\w./-]+)?$/.test(src) && !/\.md$/i.test(src) && !exists(src.split("@")[0]);
 		return shorthand ? parseSource(`git:github.com/${src}`) : { kind: "path", path: src };
 	}
 	const scheme = git.indexOf("://");

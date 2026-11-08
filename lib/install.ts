@@ -68,8 +68,10 @@ export function installInto(target: string, skills: SkillRef[], others: SkillRef
 			}
 		} catch (e) {
 			for (const name of moved.reverse()) {
-				rmSync(join(target, name), { recursive: true, force: true });
-				if (existsSync(join(staging, `.old-${name}`))) renameSync(join(staging, `.old-${name}`), join(target, name));
+				try {
+					rmSync(join(target, name), { recursive: true, force: true });
+					if (existsSync(join(staging, `.old-${name}`))) renameSync(join(staging, `.old-${name}`), join(target, name));
+				} catch {}
 			}
 			throw e;
 		}

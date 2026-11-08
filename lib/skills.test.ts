@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@jest/globals";
-import { buildRouteContext, isValidSkillName, MAX_PICKS, parsePicks, parseSource, ROUTER_FRAMING } from "./skills.ts";
+import { buildRouteContext, classifyRoute, isValidSkillName, MAX_PICKS, parsePicks, parseSource, ROUTER_FRAMING, shouldRoute } from "./skills.ts";
 
 const skills = ["a", "b", "c", "d"].map((name) => ({ name, description: `about ${name}\n  wrapped` }));
 
@@ -80,5 +80,46 @@ describe("isValidSkillName", () => {
 	});
 	it("rejects traversal, uppercase, bad hyphens, and long names", () => {
 		for (const bad of ["../x", "..", "a/b", "Foo", "-a", "a-", "a--b", "", "a".repeat(65)]) expect(isValidSkillName(bad)).toBe(false);
+	});
+});
+
+describe("parseSource shorthand with ref", () => {
+	it("checks local existence without the @ref suffix", () => {
+		expect(parseSource("user/repo@v1", (p) => p === "user/repo")).toEqual({ kind: "path", path: "user/repo@v1" });
+	});
+});
+
+describe("shouldRoute", () => {
+	const on = { skillRouting: true };
+	const user = { messageType: "user", prompt: "fix it" };
+	it("routes plain user prompts", () => {
+		expect(shouldRoute(true, user, on)).toBe(true);
+	});
+	it("skips non-user, image, skill and disabled cases", () => {
+		expect(shouldRoute(false, user, on)).toBe(false);
+		expect(shouldRoute(true, { ...user, messageType: "custom" }, on)).toBe(false);
+		expect(shouldRoute(true, { ...user, images: [{}] }, on)).toBe(false);
+		expect(shouldRoute(true, { ...user, prompt: '<skill name="a">' }, on)).toBe(false);
+		expect(shouldRoute(true, user, { skillRouting: false })).toBe(false);
+	});
+});
+
+describe("classifyRoute", () => {
+	const ok = { stopReason: "stop", text: "<picked>a, b</picked>" };
+	it("returns picks on success", () => {
+		expect(classifyRoute(ok, skills, false, false, 30000)).toEqual({ kind: "ok", picked: skills.slice(0, 2) });
+	});
+	it("prefers cancel over timeout", () => {
+		expect(classifyRoute(ok, skills, true, true, 30000)).toEqual({ kind: "cancelled" });
+	});
+	it("reports timeout", () => {
+		expect(classifyRoute(ok, skills, false, true, 30000)).toEqual({ kind: "failed", error: "timed out after 30s" });
+	});
+	it("reports non-stop reasons", () => {
+		expect(classifyRoute({ stopReason: "error", errorMessage: "boom", text: "" }, skills, false, false, 30000)).toEqual({ kind: "failed", error: "boom" });
+		expect(classifyRoute({ stopReason: "length", text: "" }, skills, false, false, 30000)).toEqual({ kind: "failed", error: "stopped: length" });
+	});
+	it("reports missing picked tags", () => {
+		expect(classifyRoute({ stopReason: "stop", text: "a" }, skills, false, false, 30000)).toEqual({ kind: "failed", error: "no <picked> output" });
 	});
 });

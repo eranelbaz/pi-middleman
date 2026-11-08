@@ -30,7 +30,7 @@ import { clip } from "../lib/output.ts";
 import { type Choice, type Outcome, type Resolution, resolveChoice, toOutcome } from "../lib/outcome.ts";
 import { buildContext, extractText, reasoningFor, shouldRefine } from "../lib/refine.ts";
 import { installInto, planInstall, type SkillRef, skillName } from "../lib/install.ts";
-import { buildRouteContext, isValidSkillName, parsePicks, parseSource } from "../lib/skills.ts";
+import { buildRouteContext, classifyRoute, isValidSkillName, parseSource, shouldRoute } from "../lib/skills.ts";
 
 const GLOBAL_PATH = join(getAgentDir(), "middleman.json");
 const GLOBAL_SKILLS = join(getAgentDir(), "middleman-skills");
@@ -93,11 +93,7 @@ async function routeSkills(ctx: ExtensionContext, model: Model, cfg: MiddlemanCo
 		const res = await ctx.modelRegistry
 			.streamSimple(model, buildRouteContext(skills, prompt), { signal, maxRetries: 0, reasoning: reasoningFor(cfg) })
 			.result();
-		if (cancel?.aborted) return { kind: "cancelled" };
-		if (timeout.aborted) return { kind: "failed", error: `timed out after ${ROUTE_TIMEOUT_MS / 1000}s` };
-		if (res.stopReason !== "stop") return { kind: "failed", error: res.errorMessage ?? `stopped: ${res.stopReason}` };
-		const picked = parsePicks(extractText(res), skills);
-		return picked ? { kind: "ok", picked } : { kind: "failed", error: "no <picked> output" };
+		return classifyRoute({ ...res, text: extractText(res) }, skills, !!cancel?.aborted, timeout.aborted, ROUTE_TIMEOUT_MS);
 	} catch (e) {
 		if (cancel?.aborted) return { kind: "cancelled" };
 		if (timeout.aborted) return { kind: "failed", error: `timed out after ${ROUTE_TIMEOUT_MS / 1000}s` };
@@ -230,7 +226,7 @@ async function installSkills(ctx: ExtensionContext, source: string, target: stri
 			if (!(await ctx.ui.confirm("Overwrite skills?", `Already installed: ${clashes.join(", ")}`))) throw new Error("cancelled, nothing installed");
 		}
 		installInto(target, install, found);
-		return { names: install.map((s) => s.name), skipped };
+		return { names: install.map((s) => s.name), skipped: [...skipped, ...problems] };
 	} finally {
 		if (tmp) rmSync(tmp, { recursive: true, force: true });
 	}
@@ -592,7 +588,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (event, ctx) => {
 		const fromUser = routeNext;
 		routeNext = false;
-		if (!fromUser || event.messageType !== "user" || event.images?.length || event.prompt.startsWith("<skill ")) return;
+		if (event.messageType !== "user" || !shouldRoute(fromUser, event, { skillRouting: true })) return;
 		let cfg: MiddlemanConfig;
 		try {
 			const state = resolve();
@@ -601,7 +597,7 @@ export default function (pi: ExtensionAPI) {
 		} catch {
 			return;
 		}
-		if (!cfg.skillRouting) return;
+		if (!shouldRoute(fromUser, event, cfg)) return;
 		const model = resolveModel(ctx, cfg);
 		if (!model) {
 			warnOnce(ctx, `model:${cfg.provider}/${cfg.model}`, "Middleman has no valid model (/middleman), skipping skill routing");
