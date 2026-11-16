@@ -50,6 +50,10 @@ function projectPath(ctx: ExtensionContext): string | undefined {
 	return join(ctx.cwd, ".pi", "middleman.json");
 }
 
+function expandPath(base: string, p: string): string {
+	return resolvePath(base, p.replace(/^~(?=$|\/)/, homedir()));
+}
+
 function resolveModel(ctx: ExtensionContext, cfg: MiddlemanConfig): Model | undefined {
 	return cfg.provider && cfg.model ? ctx.modelRegistry.find(cfg.provider, cfg.model) : undefined;
 }
@@ -131,7 +135,7 @@ async function installSkills(ctx: ExtensionContext, source: string, target: stri
 	try {
 		let root: string;
 		if (src.kind === "path") {
-			root = resolvePath(ctx.cwd, src.path.replace(/^~(?=$|\/)/, homedir()));
+			root = expandPath(ctx.cwd, src.path);
 			if (!existsSync(root)) throw new Error(`${root} does not exist`);
 		} else {
 			root = join(tmp as string, "repo");
@@ -253,10 +257,15 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		warned.clear();
 		session = {};
+		cwd = ctx.cwd;
 		loadProject(ctx);
 		refreshStatus(ctx);
 		syncSkillTool(ctx);
 	});
+
+	let cwd = "";
+	const extraSkillDirs = (): string[] => resolve().cfg.skillFolders.map((f) => expandPath(cwd, f));
+	const allSkillDirs = () => [...Object.values(skillDirs()), ...extraSkillDirs()];
 
 	const skillDirs = () => ({
 		...(project && !project.error && { project: join(dirname(project.path), "middleman-skills") }),
@@ -278,14 +287,21 @@ export default function (pi: ExtensionAPI) {
 			const target = scoped ? dirs.project : dirs.global;
 			if (scoped && !target) return ctx.ui.notify("Project skills need a repo you explicitly trusted in pi (not your home dir)", "error");
 			if (sub === "list") {
-				const lines = Object.entries(dirs).flatMap(([scope, dir]) =>
+				let extras: string[] = [];
+				try {
+					extras = extraSkillDirs();
+				} catch (e) {
+					ctx.ui.notify(`Custom skill folders skipped, config unreadable: ${(e as Error).message}`, "warning");
+				}
+				const listed = [...Object.entries(dirs), ...extras.map((d) => [d, d] as const)];
+				const lines = listed.flatMap(([scope, dir]) =>
 					loadSkillsFromDir({ dir, source: "middleman" }).skills.map((s) => `${s.name} (${scope}) — ${s.description.replace(/\s+/g, " ").slice(0, 80)}`),
 				);
 				return ctx.ui.notify(lines.length ? lines.join("\n") : `No middleman skills. Install with /middleman-skill install <source>`, "info");
 			}
 			if (sub === "remove" && arg && target) {
 				const dest = join(target, arg);
-				if (!isValidSkillName(arg) || !existsSync(join(dest, "SKILL.md"))) return ctx.ui.notify(`No skill "${arg}" in ${target}`, "error");
+				if (!isValidSkillName(arg) || !existsSync(join(dest, "SKILL.md"))) return ctx.ui.notify(`No skill "${arg}" in ${target} (skills in custom folders must be removed by hand)`, "error");
 				rmSync(dest, { recursive: true, force: true });
 				return ctx.ui.notify(`Removed middleman skill ${arg}`, "info");
 			}
@@ -352,6 +368,7 @@ export default function (pi: ExtensionAPI) {
 					skillRouting: label("Skill routing", "skillRouting"),
 					model: label("Model", "model"),
 					thinking: label("Thinking", "thinking"),
+					folders: `Skill folders: ${cfg.skillFolders.length ? `${cfg.skillFolders.length} (${scope}: ${own.skillFolders?.length ?? 0})` : "none"}`,
 					...(Object.keys(own).length && { clear: `Clear ${scope} overrides` }),
 				};
 				const choice = await pick(ctx, "Middleman", Object.values(items), last && (items as Record<string, string | undefined>)[last]);
@@ -373,6 +390,26 @@ export default function (pi: ExtensionAPI) {
 				let patch: Layer = {};
 				if (key === "skillRouting") patch = { skillRouting: !(own.skillRouting ?? cfg.skillRouting) };
 				if (key === "clear") patch = Object.fromEntries(Object.keys(own).map((k) => [k, undefined]));
+				if (key === "folders") {
+					const current = own.skillFolders ?? [];
+					const ADD = "+ Add folder";
+					const c = await pick(ctx, `Skill folders (${scope}) — select one to remove`, [ADD, ...current]);
+					if (c === ADD) {
+						const v = (await ctx.ui.input("Skills folder (absolute, ~/ or relative to the project)", "~/projects/app/.claude/skills"))?.trim();
+						const norm = (f: string) => expandPath(cwd, f);
+						if (!v) ctx.ui.notify("No folder entered", "info");
+						else if (current.some((f) => norm(f) === norm(v))) ctx.ui.notify(`${v} is already in the ${scope} list`, "info");
+						else {
+							patch = { skillFolders: [...current, v] };
+							const dir = norm(v);
+							const count = existsSync(dir) ? loadSkillsFromDir({ dir, source: "middleman" }).skills.length : -1;
+							if (count < 0) ctx.ui.notify(`${dir} does not exist (saved anyway)`, "warning");
+							else if (!count) ctx.ui.notify(`No skills found in ${dir} (saved anyway)`, "warning");
+							else ctx.ui.notify(`Found ${count} skill${count === 1 ? "" : "s"} in ${dir}`, "info");
+						}
+					} else if (c !== undefined) patch = { skillFolders: current.filter((f) => f !== c) };
+					if (patch.skillFolders && !patch.skillFolders.length) patch = { skillFolders: undefined };
+				}
 				if (key === "thinking") {
 					const t = await pick(ctx, "Thinking effort", THINKING_LEVELS, own.thinking ?? cfg.thinking);
 					const level = THINKING_LEVELS.find((l) => l === t);
@@ -391,7 +428,7 @@ export default function (pi: ExtensionAPI) {
 					if (chosen) patch = { provider: chosen.provider, model: chosen.id };
 				}
 				const keys = Object.keys(patch) as (keyof MiddlemanConfig)[];
-				if (keys.every((k) => own[k] === patch[k])) continue;
+				if (keys.every((k) => own[k] === patch[k] || (Array.isArray(own[k]) && JSON.stringify(own[k]) === JSON.stringify(patch[k])))) continue;
 				let after: ReturnType<typeof resolve>;
 				try {
 					write(scope, patch);
@@ -402,7 +439,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				for (const k of keys) {
 					const s = sourceOf(k, after.layers);
-					if (patch[k] !== undefined && s !== "default" && SCOPES.indexOf(s) < SCOPES.indexOf(scope)) {
+					if (k !== "skillFolders" && patch[k] !== undefined && s !== "default" && SCOPES.indexOf(s) < SCOPES.indexOf(scope)) {
 						ctx.ui.notify(`${k} is overridden by the ${s} config`, "warning");
 					}
 				}
@@ -472,7 +509,7 @@ export default function (pi: ExtensionAPI) {
 			if (!cfg) return text("Middleman skill routing is off; no skills available.");
 			const model = resolveModel(ctx, cfg);
 			if (!model) return text("Middleman has no valid model configured; no skills available.");
-			const skills = loadRoutedSkills(Object.values(skillDirs()));
+			const skills = loadRoutedSkills(allSkillDirs());
 			if (!skills.length) return text("No middleman skills are installed.");
 			onUpdate?.(text(`Middleman picking skills for "${need}"...`));
 			const res = await routeSkills(ctx, model, cfg, skills, need, signal);
@@ -489,7 +526,7 @@ export default function (pi: ExtensionAPI) {
 
 	const syncSkillTool = (ctx: ExtensionContext) => {
 		const cfg = routingConfig();
-		const usable = !!cfg && !!resolveModel(ctx, cfg) && loadRoutedSkills(Object.values(skillDirs())).length > 0;
+		const usable = !!cfg && !!resolveModel(ctx, cfg) && loadRoutedSkills(allSkillDirs()).length > 0;
 		const active = pi.getActiveTools();
 		if (usable === active.includes(SKILL_TOOL)) return;
 		pi.setActiveTools(usable ? [...active, SKILL_TOOL] : active.filter((t) => t !== SKILL_TOOL));
@@ -507,7 +544,7 @@ export default function (pi: ExtensionAPI) {
 			warnOnce(ctx, `model:${cfg.provider}/${cfg.model}`, "Middleman has no valid model (/middleman), skipping skill routing");
 			return;
 		}
-		const skills = loadRoutedSkills(Object.values(skillDirs()));
+		const skills = loadRoutedSkills(allSkillDirs());
 		if (!skills.length) return;
 		const res = ctx.mode === "tui" ? await routeWithLoader(ctx, model, cfg, skills, event.prompt) : await routeSkills(ctx, model, cfg, skills, event.prompt);
 		if (res.kind === "cancelled") return;

@@ -8,6 +8,7 @@ export interface MiddlemanConfig {
 	model?: string;
 	thinking: ThinkingSetting;
 	skillRouting: boolean;
+	skillFolders: string[];
 }
 
 export const THINKING_LEVELS: ThinkingSetting[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
@@ -15,6 +16,7 @@ export const THINKING_LEVELS: ThinkingSetting[] = ["off", "minimal", "low", "med
 export const DEFAULT_CONFIG: MiddlemanConfig = {
 	thinking: "off",
 	skillRouting: false,
+	skillFolders: [],
 };
 
 export class ConfigError extends Error {}
@@ -45,6 +47,7 @@ export function parseLayer(raw: unknown, path: string): Layer {
 		...(nonEmpty(r.provider) && nonEmpty(r.model) && { provider: r.provider, model: r.model }),
 		...(THINKING_LEVELS.includes(r.thinking as ThinkingSetting) && { thinking: r.thinking as ThinkingSetting }),
 		...(typeof r.skillRouting === "boolean" && { skillRouting: r.skillRouting }),
+		...(Array.isArray(r.skillFolders) && { skillFolders: r.skillFolders.filter(nonEmpty).map((f) => f.trim()) }),
 	};
 }
 
@@ -56,7 +59,8 @@ export function readLayer(path: string): Layer {
 export function mergeLayers(layers: Layer[]): MiddlemanConfig {
 	const cfg: MiddlemanConfig = { ...DEFAULT_CONFIG };
 	for (const layer of [...layers].reverse()) {
-		for (const [k, v] of Object.entries(layer)) if (v !== undefined) Object.assign(cfg, { [k]: v });
+		for (const [k, v] of Object.entries(layer)) if (v !== undefined && k !== "skillFolders") Object.assign(cfg, { [k]: v });
+		if (layer.skillFolders) cfg.skillFolders = [...new Set([...layer.skillFolders, ...cfg.skillFolders])];
 	}
 	return cfg;
 }

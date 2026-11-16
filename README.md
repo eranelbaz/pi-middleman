@@ -25,6 +25,7 @@ Changes are saved right away and apply to the next prompt without `/reload`. Wit
 Instead of installing skills into pi (where every skill's description goes into every system prompt), put them in a middleman skills folder:
 
 - global: `~/.pi/agent/middleman-skills/<name>/SKILL.md`
+- custom folders: add any skills folder (e.g. `~/projects/limy-app/.claude/skills`) via `/middleman` → Skill folders, or `"skillFolders": [...]` in `middleman.json` (global, project or session scope; they are combined). `~/` and absolute paths work everywhere; relative paths are resolved against the current project, so use them (e.g. `.claude/skills`) for per-repo folders; lowest priority on name clashes
 - project: `<cwd>/.pi/middleman-skills/<name>/SKILL.md` (trusted repos only, same rules as project config; wins on name clashes)
 
 Manage them with `/middleman-skill` (not `pi install`, so they stay out of pi's system prompt):

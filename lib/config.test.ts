@@ -116,4 +116,14 @@ describe("patchLayer", () => {
 		expect(() => patchLayer(p, { skillRouting: true })).toThrow();
 		expect(readdirSync(dirname(p))).toEqual(["middleman.json"]);
 	});
+
+	it("unions skillFolders across layers, highest scope first", () => {
+		const cfg = mergeLayers([{ skillFolders: ["a", "b"] }, {}, { skillFolders: ["b", "c"] }]);
+		expect(cfg.skillFolders).toEqual(["a", "b", "c"]);
+	});
+
+	it("parses skillFolders, trimming and dropping blanks and non-strings", () => {
+		expect(parseLayer({ skillFolders: [" ~/a ", "", 3, "b"] }, "p")).toEqual({ skillFolders: ["~/a", "b"] });
+		expect(parseLayer({ skillFolders: "x" }, "p")).toEqual({});
+	});
 });
